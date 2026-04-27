@@ -39,6 +39,28 @@ On first launch, right-click → **Open** (Gatekeeper bypass). The shared deskto
 
 ---
 
+## Headless VPS (Docker-first)
+
+> **Fork notice:** this fork tracks upstream `joi-lab/ouroboros-desktop` and adds
+> VPS deployment assets under `deploy/docker/`.
+
+This fork ships an Ubuntu VPS deployment profile focused on Telegram-first
+operation with secure-by-default dashboard access via SSH tunnel.
+
+- Deployment assets and scripts: `deploy/docker/`
+- Operator quickstart: `deploy/docker/README.md`
+
+Typical host lifecycle commands:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/keXXpert/ouroboros-headless/main/deploy/docker/install.sh | sudo bash
+sudo /opt/ouroboros-headless/deploy/docker/update.sh --ref <tag-or-commit>
+sudo /opt/ouroboros-headless/deploy/docker/backup.sh
+sudo /opt/ouroboros-headless/deploy/docker/doctor.sh
+```
+
+---
+
 ## What Makes This Different
 
 Most AI agents execute tasks. Ouroboros **creates itself.**
