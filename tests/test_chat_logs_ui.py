@@ -112,17 +112,11 @@ def test_styles_cover_chat_header_controls_and_grouped_cards():
 
 
 def test_chat_floating_overlays_have_readable_glass_backing():
-    """v5: floating overlays at the top and bottom of the chat fade
-    fully to transparent at the inner edge (no visible step). The
-    blur is masked in lockstep so the glass effect does not create
-    its own hard border. Status badge and attachment badge keep
-    their solid backings (those are inline pills, not scrim layers).
-    """
+    """Header scrim remains readable; the bottom chat fade is gone."""
     css = _read("web/style.css")
 
     header = re.search(r"\.chat-page-header\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
     status = re.search(r"\.status-badge\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
-    input_area = re.search(r"#chat-input-area\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
     attach = re.search(r"\.attach-badge\s*\{(?P<body>[^}]+)\}", css, re.S).group("body")
 
     # Header: glass blur active, gradient ENDS at fully-transparent
@@ -132,12 +126,10 @@ def test_chat_floating_overlays_have_readable_glass_backing():
     assert "rgba(13, 11, 15, 0.00) 100%" in header
     assert "mask-image:" in header
 
-    # Bottom input dock: same fade-to-zero contract.
-    assert "rgba(13, 11, 15, 0.00) 100%" in input_area
-    assert "mask-image:" in input_area
+    assert ".chat-bottom-fade" not in css
 
     # Inline pills keep their solid backings — the test only enforces
-    # the fade-to-zero invariant on the scrim layers (header / dock).
+    # the fade-to-zero invariant on the scrim layers (header / fade).
     assert "backdrop-filter: blur(8px)" in status
     assert "rgba(26, 21, 32, 0.78)" in status
     assert "backdrop-filter: blur(8px)" in attach
@@ -733,10 +725,12 @@ def test_sync_history_appends_disconnected_unfinished_cards_at_end():
         "liveCardRecords sweep must appear after pass-2 message loop"
 
 
-def test_chat_send_group_vertically_centered():
-    """Send group wrapper must use top:50% + translateY(-50%) so all send controls
-    stay vertically centered inside the textarea, including when it grows to
-    multiple lines (v4.39.1 switched from bottom:8px to true vertical centering)."""
+def test_chat_send_group_bottom_aligned_for_multiline_composer():
+    """Send controls stay anchored near the final textarea line on mobile.
+
+    Centering them in a growing multiline textarea made the send affordance look
+    stuck mid-field, especially after staging a file attachment.
+    """
     css = _read("web/style.css")
 
     # The absolute positioning lives on .chat-send-group, not .chat-send-inline.
@@ -744,10 +738,10 @@ def test_chat_send_group_vertically_centered():
     rule_end = css.index("\n}", rule_start) + 2
     rule_body = css[rule_start:rule_end]
 
-    assert "top: 50%" in rule_body, \
-        ".chat-send-group must use top: 50% for vertical centering (v4.39.1)"
-    assert "translateY(-50%)" in rule_body, \
-        ".chat-send-group must use translateY(-50%) for vertical centering (v4.39.1)"
+    assert "bottom: 7px" in rule_body, \
+        ".chat-send-group must anchor to the bottom edge of the multiline composer"
+    assert "translateY(-50%)" not in rule_body, \
+        ".chat-send-group must not vertically center inside a multiline composer"
     assert "position: absolute" in rule_body, \
         ".chat-send-group must be position: absolute"
     # The Send button itself must NOT re-introduce absolute positioning
@@ -758,19 +752,18 @@ def test_chat_send_group_vertically_centered():
         ".chat-send-inline must not use position: absolute (handled by parent .chat-send-group)"
 
 
-def test_chat_attach_button_vertically_centered():
-    """Paperclip button must use the same top:50% + translateY(-50%) centering as
-    .chat-send-group so both buttons stay aligned inside the textarea (v4.39.1)."""
+def test_chat_attach_button_bottom_aligned_for_multiline_composer():
+    """Paperclip button follows the send control at the textarea baseline."""
     css = _read("web/style.css")
 
     rule_start = css.index(".chat-attach-btn {")
     rule_end = css.index("\n}", rule_start) + 2
     rule_body = css[rule_start:rule_end]
 
-    assert "top: 50%" in rule_body, \
-        ".chat-attach-btn must use top: 50% for vertical centering (v4.39.1)"
-    assert "translateY(-50%)" in rule_body, \
-        ".chat-attach-btn must use translateY(-50%) for vertical centering (v4.39.1)"
+    assert "bottom: 9px" in rule_body, \
+        ".chat-attach-btn must anchor to the bottom edge of the multiline composer"
+    assert "translateY(-50%)" not in rule_body, \
+        ".chat-attach-btn must not vertically center inside a multiline composer"
 
 
 # --- Plan mode send tests ---
@@ -783,6 +776,13 @@ def test_plan_mode_dom_elements_present():
     assert 'id="chat-dropdown-plan"' in source, "chat-dropdown-plan item must be present"
     assert 'id="chat-dropdown-send"' in source, "chat-dropdown-send item must be present"
     assert 'class="chat-send-group"' in source, "chat-send-group wrapper must be present"
+
+
+def test_skill_review_click_guard_prevents_duplicate_posts():
+    source = _read("web/modules/skills.js")
+    assert "if (reviewingSkills.has(name)) return;" in source
+    assert "target.disabled = true;" in source
+    assert "reviewingSkills.add(name);" in source
 
 
 def test_plan_mode_send_message_accepts_plan_flag():
@@ -1054,3 +1054,77 @@ def test_sync_history_sweep_skips_invisible_completed_cards():
         "The final sweep guard must also check ts.completed so in-progress tasks "
         "without cardVisible are still appended"
     )
+
+
+# ─── Autocorrect / spellcheck suppression on #chat-input ────────────────
+
+def test_chat_input_disables_autocorrect():
+    """#chat-input textarea must disable browser autocorrect/spellcheck/autocapitalize.
+
+    These attributes prevent the browser from silently rewriting code,
+    identifiers, slash-commands, and other technical input. Test asserts
+    each attribute by literal substring match against the textarea template
+    string in chat.js (no JSDOM — chat.js builds its own template at runtime).
+    """
+    source = _read("web/modules/chat.js")
+    assert 'id="chat-input"' in source, "chat-input textarea must exist"
+    assert 'autocorrect="off"' in source, (
+        "chat-input textarea must set autocorrect='off'"
+    )
+    assert 'autocapitalize="off"' in source, (
+        "chat-input textarea must set autocapitalize='off'"
+    )
+    assert 'spellcheck="false"' in source, (
+        "chat-input textarea must set spellcheck='false'"
+    )
+
+
+# ─── Clipboard image paste handler ──────────────────────────────────────
+
+def test_clipboard_paste_handler_exists():
+    """chat.js must register a `paste` listener that intercepts image/* clipboard
+    items and routes them through the same staging path the paperclip uses.
+
+    Verified by literal substring assertions: the listener registration, the
+    image/* MIME guard, the `pendingAttachment` set, and the `clipboard-`
+    filename prefix. No DOM execution — these strings are stable contract
+    surface for the feature.
+    """
+    source = _read("web/modules/chat.js")
+    assert (
+        "addEventListener('paste'" in source
+        or 'addEventListener("paste"' in source
+    ), (
+        "chat.js must register a paste event listener for clipboard image support"
+    )
+    assert "image/" in source, (
+        "paste handler must guard on image/* MIME type"
+    )
+    assert "pendingAttachment" in source, (
+        "paste handler must set pendingAttachment for the staged image"
+    )
+    assert "clipboard-" in source, (
+        "paste handler must generate a clipboard-prefixed filename"
+    )
+
+
+# ─── Bottom-fade gradient layer is separate from #chat-input-area ───────
+
+def test_chat_bottom_fade_is_removed_and_padding_is_dynamic():
+    """Bottom fade is removed; input overlap is handled by JS padding."""
+    css = _read("web/style.css")
+    input_area_match = re.search(
+        r"#chat-input-area\s*\{([^}]*)\}",
+        css,
+    )
+    assert input_area_match, "#chat-input-area rule must be parseable"
+    input_area_body = input_area_match.group(1)
+    # We tolerate other `background:` properties (none expected today) but
+    # specifically forbid linear-gradient bleeding through the input dock.
+    assert "linear-gradient" not in input_area_body, (
+        "#chat-input-area must not paint a bottom-fade gradient."
+    )
+    chat_js = _read("web/modules/chat.js")
+    assert 'class="chat-bottom-fade"' not in chat_js
+    assert "ResizeObserver" in chat_js
+    assert "scrollToBottomAfterLayout" in chat_js

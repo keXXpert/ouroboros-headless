@@ -1,3 +1,5 @@
+import { initMarketplace } from './marketplace.js';
+
 /**
  * Ouroboros Skills UI — Phase 5.
  *
@@ -14,11 +16,8 @@ function skillsPageTemplate() {
             <div class="skills-header">
                 <h2>Skills</h2>
                 <p class="muted">
-                    Skills discovered under <code>data/skills/{native,clawhub,external}/</code>
-                    plus the optional <code>OUROBOROS_SKILLS_REPO_PATH</code> checkout.
-                    A skill must be <b>enabled</b> and carry a fresh <b>PASS</b> review
-                    verdict before <code>skill_exec</code> (scripts) or the in-process
-                    dispatch (<code>ext.&lt;skill&gt;.*</code>) will run it.
+                    Skills extend Ouroboros with new tools, routes, and widgets.
+                    Each skill is reviewed for safety before you turn it on.
                 </p>
                 <div class="skills-tabs" role="tablist" aria-label="Skills views">
                     <button class="skills-tab is-active" data-tab="installed" role="tab" aria-selected="true">
@@ -34,15 +33,12 @@ function skillsPageTemplate() {
                 <div id="skills-migration-banner" class="skills-migration-banner" hidden></div>
                 <div class="skills-controls">
                     <button id="skills-refresh" class="btn btn-default">Refresh</button>
-                    <span id="skills-runtime-mode" class="muted"></span>
                 </div>
                 <div id="skills-list" class="skills-list"></div>
                 <div id="skills-empty" class="muted" hidden>
-                    No skills discovered yet. Install one from the
-                    <b>Marketplace</b> tab, drop a <code>SKILL.md</code> package
-                    into <code>data/skills/external/</code>, or point
-                    <code>OUROBOROS_SKILLS_REPO_PATH</code> at your own checkout
-                    in Settings &rarr; Behavior &rarr; External Skills Repo.
+                    No skills installed yet. Browse the
+                    <b>Marketplace</b> tab to add one, or import a custom
+                    package from the Files tab.
                 </div>
             </div>
             <div class="skills-tab-panel" id="skills-pane-marketplace" data-pane="marketplace" hidden></div>
@@ -71,6 +67,140 @@ function statusBadge(status) {
         : status === 'advisory' ? 'warn'
         : 'muted';
     return `<span class="skills-badge skills-badge-${tone}">${escapeHtml(status)}</span>`;
+}
+
+function reviewReady(skill) {
+    return skill.review_status === 'pass' && !skill.review_stale;
+}
+
+function grantReady(skill) {
+    return !skill.grants || skill.grants.all_granted !== false;
+}
+
+// v5.2.3: collapse the previous wall of competing badges
+// (NATIVE / PASS / LIVE / ENABLED / GRANT MISSING / etc.) into a single
+// human-readable status chip per card. The detailed flags stay
+// available under the Details disclosure for advanced operators.
+function skillStatusChip(skill) {
+    if (skill.load_error) {
+        return { tone: 'danger', label: 'Failed to load' };
+    }
+    if (!reviewReady(skill)) {
+        return { tone: 'warn', label: 'Needs review' };
+    }
+    if (!grantReady(skill)) {
+        return { tone: 'warn', label: 'Needs access grant' };
+    }
+    if (skill.enabled) {
+        if (skill.type === 'extension') {
+            if (skill.live_loaded && skill.dispatch_live) {
+                return { tone: 'ok', label: 'Active' };
+            }
+            if (skill.live_loaded && !skill.dispatch_live) {
+                return { tone: 'warn', label: 'Loaded — UI tab pending' };
+            }
+            return { tone: 'warn', label: 'Enabled — not loaded' };
+        }
+        return { tone: 'ok', label: 'Enabled' };
+    }
+    return { tone: 'muted', label: 'Off' };
+}
+
+// v5.2.3 follow-up (review): surface a calm provenance label on the
+// card front face. Built-in skills carry no chip (the absence is the
+// signal). Third-party / external skills get a small muted/warn pill
+// next to the title so operators can tell at a glance who shipped the
+// code without expanding Show details. Mirrors P1 "Provenance matters".
+function skillSourceChip(skill) {
+    const source = (skill.source || 'native').toLowerCase();
+    if (source === 'native') {
+        return '';
+    }
+    const labelMap = {
+        clawhub: { label: 'ClawHub', tone: 'warn' },
+        external: { label: 'External', tone: 'muted' },
+        user_repo: { label: 'User repo', tone: 'muted' },
+    };
+    const entry = labelMap[source] || { label: source, tone: 'muted' };
+    return `<span class="skills-source-chip skills-source-${entry.tone}" title="Source: ${escapeHtml(entry.label)}">${escapeHtml(entry.label)}</span>`;
+}
+
+function renderReviewFindings(skill) {
+    const findings = Array.isArray(skill.review_findings) ? skill.review_findings : [];
+    if (!findings.length) return '';
+    const rows = findings.map((finding) => {
+        const item = finding.item || finding.check || finding.title || 'finding';
+        const verdict = finding.verdict || finding.severity || '';
+        const reason = finding.reason || finding.message || JSON.stringify(finding);
+        return `<li><strong>${escapeHtml(verdict)}</strong> ${escapeHtml(item)}: ${escapeHtml(reason)}</li>`;
+    }).join('');
+    return `
+        <details class="skills-review-findings">
+            <summary class="muted">${findings.length} review finding${findings.length === 1 ? '' : 's'}</summary>
+            <ul>${rows}</ul>
+        </details>
+    `;
+}
+
+function renderGrantBlock(skill) {
+    const grants = skill.grants || {};
+    const requested = Array.isArray(grants.requested_keys) ? grants.requested_keys : [];
+    // v5.2.3: keep the affordance discoverable but quiet the copy.
+    // Skills that do not request any core keys get a single muted
+    // line at the bottom of the Details disclosure instead of a
+    // dedicated section on the front face of the card.
+    if (!requested.length) {
+        return '';
+    }
+    const missing = Array.isArray(grants.missing_keys) ? grants.missing_keys : [];
+    const granted = Array.isArray(grants.granted_keys) ? grants.granted_keys : [];
+    const unsupported = grants.unsupported_for_skill_type === true;
+    const reviewBlocked = !reviewReady(skill);
+
+    const requestedKeysHtml = requested
+        .map((key) => `<code>${escapeHtml(key)}</code>`)
+        .join(' ');
+
+    let statusLine;
+    let statusTone;
+    if (unsupported) {
+        statusLine = 'This skill type cannot receive core API keys.';
+        statusTone = 'muted';
+    } else if (!missing.length) {
+        statusLine = 'Access granted.';
+        statusTone = 'ok';
+    } else if (reviewBlocked) {
+        statusLine = 'Run a security review first, then grant access.';
+        statusTone = 'warn';
+    } else {
+        statusLine = 'This skill needs your permission to use the keys above.';
+        statusTone = 'warn';
+    }
+
+    let grantButton = '';
+    if (!unsupported && missing.length) {
+        if (reviewBlocked) {
+            grantButton = `<button class="btn btn-default skills-grant" disabled title="Run a fresh PASS review before granting access.">Grant access</button>`;
+        } else {
+            grantButton = `<button class="btn btn-primary skills-grant" data-skill="${escapeHtml(skill.name)}" data-keys="${escapeHtml(requested.join(','))}">Grant access</button>`;
+        }
+    }
+
+    const grantedRow = granted.length
+        ? `<div class="skills-access-row"><span class="skills-access-label">Granted</span> ${granted.map((k) => `<code>${escapeHtml(k)}</code>`).join(' ')}</div>`
+        : '';
+
+    return `
+        <div class="skills-access skills-access-${statusTone}">
+            <div class="skills-access-row">
+                <span class="skills-access-label">Needs API keys</span>
+                ${requestedKeysHtml}
+            </div>
+            ${grantedRow}
+            <div class="skills-access-status">${escapeHtml(statusLine)}</div>
+            ${grantButton ? `<div class="skills-access-actions">${grantButton}</div>` : ''}
+        </div>
+    `;
 }
 
 
@@ -153,284 +283,168 @@ function renderProvenanceBlock(prov) {
 }
 
 
-function renderSkillCard(skill) {
-    const permissions = (skill.permissions || [])
-        .map(p => `<code>${escapeHtml(p)}</code>`)
-        .join(' ');
+function toggleLockReason(skill) {
+    // v5.2.2: an enable-toggle is "locked" when either the review is
+    // not fresh PASS or any requested core key grant is missing. Both
+    // gates are also enforced server-side in ``api_skill_toggle``;
+    // surfacing them on the card prevents users from clicking a
+    // button that will only fail with HTTP 409.
+    if (!reviewReady(skill)) {
+        return skill.review_stale
+            ? 'review stale — re-run review'
+            : 'fresh PASS review required';
+    }
+    if (!grantReady(skill)) {
+        const grants = skill.grants || {};
+        if (grants.unsupported_for_skill_type) {
+            return 'core keys unsupported for this skill type';
+        }
+        const missing = Array.isArray(grants.missing_keys) ? grants.missing_keys : [];
+        return missing.length
+            ? `grant missing for ${missing.join(', ')}`
+            : 'requested key grants required';
+    }
+    return '';
+}
+
+function renderSkillCard(skill, reviewingSkills = new Set()) {
+    const safeName = escapeHtml(skill.name);
+    const description = escapeHtml(skill.description || '');
+    const installedVersion = skill.version || '—';
+    const reviewInProgress = reviewingSkills.has(skill.name);
+
+    const lockReason = toggleLockReason(skill);
+    // v5.2.2/3: enable transitions are locked by review + grant gates.
+    // Disable transitions stay clickable so an owner can always pull
+    // a misbehaving skill offline even if its review goes stale.
+    const toggleLocked = !skill.enabled && Boolean(lockReason);
+    // v5.2.3 review-cycle fix: use the skill name as the accessible
+    // name and ``role="switch"`` so AT users hear "weather, on, switch"
+    // instead of the awkward "Disable weather, checked, checkbox".
+    const toggleAriaLabel = toggleLocked
+        ? `${skill.name} (locked: ${lockReason})`
+        : skill.name;
+
+    const status = skillStatusChip(skill);
+    const statusChip = `<span class="skills-status-chip skills-status-${status.tone}">${escapeHtml(status.label)}</span>`;
+    const sourceChip = skillSourceChip(skill);
+
+    const toggleSwitch = `
+        <label class="skills-switch ${toggleLocked ? 'is-locked' : ''}" title="${escapeHtml(toggleLocked ? `Locked: ${lockReason}` : (skill.enabled ? 'Turn skill off' : 'Turn skill on'))}">
+            <input type="checkbox"
+                   class="skills-toggle"
+                   role="switch"
+                   data-skill="${safeName}"
+                   ${skill.enabled ? 'checked' : ''}
+                   ${toggleLocked ? 'disabled' : ''}
+                   aria-checked="${skill.enabled ? 'true' : 'false'}"
+                   aria-label="${escapeHtml(toggleAriaLabel)}">
+            <span class="skills-switch-track" aria-hidden="true">
+                <span class="skills-switch-thumb"></span>
+            </span>
+        </label>
+    `;
+
+    const lockHint = toggleLocked
+        ? `<div class="skills-lock-hint" title="${escapeHtml(lockReason)}">Locked: ${escapeHtml(lockReason)}</div>`
+        : '';
+    const reviewProgress = reviewInProgress
+        ? `
+            <div class="skills-review-progress" role="status" aria-live="polite">
+                <span class="skills-review-spinner" aria-hidden="true"></span>
+                <span>Review in progress</span>
+            </div>
+        `
+        : '';
+
     const loadError = skill.load_error
         ? `<div class="skills-load-error">${escapeHtml(skill.load_error)}</div>`
         : '';
-    const reviewStaleNote = skill.review_stale
-        ? '<span class="skills-badge skills-badge-warn">stale</span>'
-        : '';
-    const liveBadge = extensionLiveBadge(skill);
-    const safeName = escapeHtml(skill.name);
+
     const source = (skill.source || 'native').toLowerCase();
-    const sourceLabel = source === 'clawhub' ? 'clawhub'
-        : source === 'native' ? 'native'
-        : source === 'external' ? 'external'
-        : source === 'user_repo' ? 'user repo'
-        : escapeHtml(source);
-    const sourceTone = source === 'clawhub' ? 'warn' : 'muted';
+    const sourceLabel = source === 'clawhub' ? 'ClawHub'
+        : source === 'native' ? 'Built-in'
+        : source === 'external' ? 'External'
+        : source === 'user_repo' ? 'User repo'
+        : source;
+
     const isClawhub = source === 'clawhub';
     const provenance = isClawhub ? skill.provenance : null;
-    // ``update_available`` requires both an installed version (the
-    // skill manifest's ``version``) AND a registry-side latest version.
-    // The installed catalogue does not currently embed the latest from
-    // the registry, but the marketplace pane updates in step. Here we
-    // surface the installed version pin so the card carries truthful
-    // version metadata; the Marketplace tab card surfaces "update
-    // available" against the registry latest. To avoid drift on the
-    // Installed tab we also expose ``provenance.version`` if it
-    // diverges from the manifest version (would only happen if the
-    // user hand-edited the SKILL.md, which is the kind of state the
-    // operator should be told about).
-    const installedVersion = skill.version || '—';
-    const provenanceVersion = provenance?.version || '';
-    const versionDriftBadge = (provenanceVersion && provenanceVersion !== installedVersion)
-        ? `<span class="skills-badge skills-badge-warn" title="Provenance version (${escapeHtml(provenanceVersion)}) differs from manifest version (${escapeHtml(installedVersion)}). Skill may have been hand-edited.">version drift</span>`
-        : '';
     const updateBtn = isClawhub
         ? `<button class="btn btn-default skills-update" data-skill="${safeName}">Update</button>`
         : '';
     const uninstallBtn = isClawhub
         ? `<button class="btn btn-default skills-uninstall" data-skill="${safeName}">Uninstall</button>`
         : '';
-    const provenanceBlock = renderProvenanceBlock(provenance);
-    // v5: live extension widget mount-point. The widget host is
-    // populated only for ``type: extension`` skills that registered an
-    // ``ui_tab`` and successfully went live (``dispatch_live``). The
-    // actual widget renderer is registered in
-    // :func:`registerWidgetRenderer` below; we just emit the host
-    // ``<div data-skill-widget>`` here and let the renderer mount in.
-    const widgetMount = (skill.type === 'extension' && skill.live_loaded && skill.dispatch_live)
-        ? `<div class="skills-widget-mount" data-skill-widget="${safeName}"></div>`
+
+    // v5.2.3 review-cycle fix: review findings are a primary safety
+    // signal (P3). Promote the disclosure out of "Show details" so a
+    // user with a fail/advisory verdict sees the count one click
+    // away from the front face, not two.
+    const reviewFindings = renderReviewFindings(skill);
+
+    // Detail disclosure — power-user metadata only.
+    const permissions = (skill.permissions || [])
+        .map((p) => `<code>${escapeHtml(p)}</code>`)
+        .join(' ');
+    const provenanceVersion = provenance?.version || '';
+    const versionDrift = (provenanceVersion && provenanceVersion !== installedVersion)
+        ? `<div class="skills-detail-row"><span class="skills-detail-label">Version drift</span> manifest ${escapeHtml(installedVersion)} vs registry ${escapeHtml(provenanceVersion)}</div>`
         : '';
+    const liveLine = (skill.type === 'extension' && skill.live_loaded && skill.dispatch_live)
+        ? `<div class="skills-detail-row"><span class="skills-detail-label">Visual widgets</span> available on the Widgets tab</div>`
+        : '';
+    const provenanceBlock = renderProvenanceBlock(provenance);
+    const detailsBody = `
+        <div class="skills-detail-row">
+            <span class="skills-detail-label">Type</span>
+            <code>${escapeHtml(skill.type || 'skill')}</code> · version ${escapeHtml(installedVersion)} · source ${escapeHtml(sourceLabel)}
+        </div>
+        <div class="skills-detail-row">
+            <span class="skills-detail-label">Review</span>
+            ${statusBadge(skill.review_status)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">stale</span>' : ''}
+        </div>
+        <div class="skills-detail-row">
+            <span class="skills-detail-label">Permissions</span>
+            ${permissions || '<i class="muted">none</i>'}
+        </div>
+        ${versionDrift}
+        ${liveLine}
+        ${provenanceBlock}
+    `;
+    const details = `
+        <details class="skills-details">
+            <summary>Show details</summary>
+            ${detailsBody}
+        </details>
+    `;
+
     return `
-        <div class="skills-card" data-skill="${safeName}">
-            <div class="skills-card-head">
+        <article class="skills-card" data-skill="${safeName}" ${reviewInProgress ? 'data-reviewing="1"' : ''}>
+            <header class="skills-card-head">
                 <div class="skills-card-title">
-                    <strong>${safeName}</strong>
-                    <span class="muted">${escapeHtml(skill.type)}@${escapeHtml(installedVersion)}</span>
+                    <h3>${safeName}${sourceChip ? ` ${sourceChip}` : ''}</h3>
+                    ${description ? `<p class="skills-card-desc">${description}</p>` : ''}
                 </div>
-                <div class="skills-card-status">
-                    <span class="skills-badge skills-badge-${sourceTone}">${sourceLabel}</span>
-                    ${statusBadge(skill.review_status)}
-                    ${reviewStaleNote}
-                    ${versionDriftBadge}
-                    ${liveBadge}
-                    ${skill.enabled ? '<span class="skills-badge skills-badge-ok">enabled</span>'
-                                    : '<span class="skills-badge skills-badge-muted">disabled</span>'}
+                <div class="skills-card-toggle">
+                    ${statusChip}
+                    ${toggleSwitch}
                 </div>
-            </div>
-            <div class="skills-card-perms">permissions: ${permissions || '<i>none</i>'}</div>
-            ${provenanceBlock}
-            ${extensionLiveNote(skill)}
-            ${widgetMount}
+            </header>
+            ${lockHint}
+            ${reviewProgress}
+            ${renderGrantBlock(skill)}
+            ${reviewFindings}
             ${loadError}
-            <div class="skills-card-actions">
-                <button class="btn btn-default skills-review" data-skill="${safeName}">Review</button>
-                <button class="btn btn-default skills-toggle" data-skill="${safeName}" data-enabled="${skill.enabled}">
-                    ${skill.enabled ? 'Disable' : 'Enable'}
-                </button>
+            <footer class="skills-card-actions">
+                <button class="btn btn-default skills-review" data-skill="${safeName}" ${reviewInProgress ? 'disabled' : ''}>Review</button>
                 ${updateBtn}
                 ${uninstallBtn}
-            </div>
-        </div>
+                ${details}
+            </footer>
+        </article>
     `;
 }
-
-
-// ---------------------------------------------------------------------------
-// Skill widget host — v5
-// ---------------------------------------------------------------------------
-//
-// Each ``type: extension`` skill that needs a visual surface registers a
-// renderer keyed by skill name. After a card render pass the host
-// scans for ``[data-skill-widget="<name>"]`` mount points and invokes
-// the matching renderer. Renderers receive the host element + the
-// skill catalog row and own their own state.
-//
-// We deliberately keep this in-tree (not loaded from the extension
-// itself) because:
-//   1. Extension code runs in Python; the JS visual layer needs to be
-//      shipped with the launcher to stay reviewable.
-//   2. Cross-origin or CSP-restricted dynamic imports of arbitrary JS
-//      from disk would defeat the review gate.
-//   3. v5 only ships ``weather`` as an extension widget; future skills
-//      with widgets will register here in the same place.
-//
-// A future iteration may move this to a per-skill ``widget.js`` loaded
-// from the skill package after a separate UI review gate.
-
-const _widgetRenderers = new Map();
-
-function registerWidgetRenderer(skillName, renderFn) {
-    _widgetRenderers.set(skillName, renderFn);
-}
-
-function mountSkillWidgets(rootEl) {
-    if (!rootEl) return;
-    const mounts = rootEl.querySelectorAll('[data-skill-widget]');
-    mounts.forEach((host) => {
-        const name = host.dataset.skillWidget;
-        const renderer = _widgetRenderers.get(name);
-        if (!renderer) {
-            host.innerHTML = `<div class="muted">no widget renderer registered for <code>${escapeHtml(name)}</code></div>`;
-            return;
-        }
-        try {
-            renderer(host);
-        } catch (err) {
-            host.innerHTML = `<div class="skills-load-error">widget mount failed: ${escapeHtml(err.message || err)}</div>`;
-        }
-    });
-}
-
-
-/**
- * Weather extension widget — v5.
- *
- * Renders an inline live weather card under the weather skill row on
- * the Installed tab. Uses the extension's own
- * ``GET /api/extensions/weather/forecast?city=...`` route registered
- * in ``skills/weather/plugin.py``. Reactive on city input + Refresh.
- *
- * State is cached in a module-level ``Map`` so re-renders triggered
- * by other skill actions (toggle, review, install) do not re-issue
- * a wttr.in call. The cache survives within the SPA session; a hard
- * page reload starts fresh.
- */
-const _weatherWidgetState = {
-    city: 'Moscow',
-    lastResult: null,
-    lastError: '',
-    lastFetchedAt: 0,
-    // v5 Cycle 1 Gemini Finding 7: token guards against concurrent
-    // refresh() calls. ``inflightToken`` is incremented on every
-    // entry; a fetch resolves into widget state only when the token
-    // it was issued under still equals the current value. This stops
-    // last-writer-wins thrash when ``renderSkillsList`` re-mounts the
-    // widget mid-fetch (or the user clicks Refresh twice quickly).
-    inflightToken: 0,
-};
-
-function _renderWeatherWidget(host) {
-    if (host.dataset.bootstrapped === '1') return;
-    host.dataset.bootstrapped = '1';
-    host.innerHTML = `
-        <div class="skill-widget-weather" role="region" aria-label="Weather widget">
-            <form class="skill-widget-weather-form" novalidate>
-                <input type="text"
-                       class="skill-widget-weather-city"
-                       placeholder="City (e.g., Moscow)"
-                       autocomplete="off"
-                       maxlength="80"
-                       aria-label="City">
-                <button type="submit" class="btn btn-default" aria-label="Refresh weather">Refresh weather</button>
-            </form>
-            <div class="skill-widget-weather-body" data-state="idle">
-                <div class="muted">Type a city and press Refresh.</div>
-            </div>
-        </div>
-    `;
-    const form = host.querySelector('form');
-    const cityInput = host.querySelector('.skill-widget-weather-city');
-    const body = host.querySelector('.skill-widget-weather-body');
-    cityInput.value = _weatherWidgetState.city;
-
-    function renderResult(data) {
-        body.dataset.state = 'ok';
-        body.innerHTML = `
-            <div class="skill-widget-weather-card">
-                <div class="skill-widget-weather-head">
-                    <strong>${escapeHtml(data.resolved_to || data.city || cityInput.value)}</strong>
-                    ${data.country ? `<span class="muted"> · ${escapeHtml(data.country)}</span>` : ''}
-                </div>
-                <div class="skill-widget-weather-temp">
-                    ${escapeHtml(String(data.temp_c ?? '—'))}°C
-                    <span class="muted"> · feels like ${escapeHtml(String(data.feels_like_c ?? '—'))}°C</span>
-                </div>
-                <div class="skill-widget-weather-cond">${escapeHtml(data.condition || 'Unknown')}</div>
-                <div class="skill-widget-weather-meta muted">
-                    <span>humidity: ${escapeHtml(String(data.humidity_pct ?? 0))}%</span>
-                    <span>wind: ${escapeHtml(String(data.wind_kph ?? 0))} km/h ${escapeHtml(data.wind_dir || '')}</span>
-                    ${data.observation_time ? `<span>at ${escapeHtml(data.observation_time)}</span>` : ''}
-                </div>
-            </div>
-        `;
-    }
-
-    function renderError(message) {
-        body.dataset.state = 'error';
-        body.innerHTML = `<div class="skills-load-error">${escapeHtml(message)}</div>`;
-    }
-
-    // Restore from cache if fresh.
-    if (_weatherWidgetState.lastResult) {
-        renderResult(_weatherWidgetState.lastResult);
-    } else if (_weatherWidgetState.lastError) {
-        renderError(_weatherWidgetState.lastError);
-    }
-
-    async function refresh() {
-        const myToken = ++_weatherWidgetState.inflightToken;
-        const city = (cityInput.value || '').trim();
-        _weatherWidgetState.city = city;
-        if (!city) {
-            _weatherWidgetState.lastResult = null;
-            _weatherWidgetState.lastError = '';
-            body.dataset.state = 'idle';
-            body.innerHTML = '<div class="muted">Type a city and press Refresh.</div>';
-            return;
-        }
-        body.dataset.state = 'loading';
-        body.innerHTML = '<div class="muted">Fetching wttr.in…</div>';
-        try {
-            const url = `/api/extensions/weather/forecast?city=${encodeURIComponent(city)}`;
-            const resp = await fetch(url);
-            const data = await resp.json().catch(() => ({}));
-            if (myToken !== _weatherWidgetState.inflightToken) {
-                // A newer refresh fired while we were waiting — drop
-                // this stale response so it does not overwrite the
-                // current city's result.
-                return;
-            }
-            if (!resp.ok || data.error) {
-                _weatherWidgetState.lastResult = null;
-                _weatherWidgetState.lastError = data.error || `HTTP ${resp.status}`;
-                renderError(_weatherWidgetState.lastError);
-                return;
-            }
-            _weatherWidgetState.lastResult = data;
-            _weatherWidgetState.lastError = '';
-            _weatherWidgetState.lastFetchedAt = Date.now();
-            renderResult(data);
-        } catch (err) {
-            if (myToken !== _weatherWidgetState.inflightToken) return;
-            _weatherWidgetState.lastResult = null;
-            _weatherWidgetState.lastError = err.message || String(err);
-            renderError(_weatherWidgetState.lastError);
-        }
-    }
-
-    form.addEventListener('submit', (event) => {
-        event.preventDefault();
-        refresh();
-    });
-    // Auto-refresh on the very first mount in this SPA session so the
-    // card shows live data without a manual click. Subsequent re-mounts
-    // (triggered by other skill actions re-rendering the list) hit the
-    // cache instead and stay quiet.
-    const stale = (Date.now() - _weatherWidgetState.lastFetchedAt) > 5 * 60 * 1000;
-    if (!_weatherWidgetState.lastResult && !_weatherWidgetState.lastError) {
-        refresh();
-    } else if (stale) {
-        refresh();
-    }
-}
-
-registerWidgetRenderer('weather', _renderWeatherWidget);
 
 
 async function fetchSkills() {
@@ -453,26 +467,27 @@ async function fetchSkills() {
 }
 
 
-async function renderSkillsList(container, emptyEl, runtimeModeEl) {
+async function renderSkillsList(container, emptyEl, runtimeModeEl, reviewingSkills = new Set()) {
     const { runtimeMode, skillsRepoConfigured, skills } = await fetchSkills();
-    runtimeModeEl.textContent = `runtime_mode: ${runtimeMode}`;
+    // v5.2.3: ``runtime_mode: light`` is technical jargon irrelevant
+    // to the typical user; show it only as a discreet annotation when
+    // the element is present in the page template (some hosts strip
+    // it for a cleaner header).
+    if (runtimeModeEl) {
+        runtimeModeEl.textContent = runtimeMode === 'pro'
+            ? 'Pro mode'
+            : runtimeMode === 'advanced'
+            ? ''
+            : `${runtimeMode} mode`;
+    }
     if (!skills.length && !skillsRepoConfigured) {
         container.innerHTML = '';
-        emptyEl.hidden = false;
+        if (emptyEl) emptyEl.hidden = false;
         return;
     }
-    emptyEl.hidden = true;
-    container.innerHTML = skills.map(renderSkillCard).join('')
-        || '<div class="muted">No skills yet. Add a skill from the <b>Marketplace</b> tab or drop a <code>SKILL.md</code> package into <code>data/skills/external/</code>.</div>';
-    // v5: mount any inline extension widgets (e.g. weather) into the
-    // freshly-rendered cards. The container.innerHTML rewrite above
-    // destroys every prior widget host, so each refresh re-mounts
-    // from scratch. The ``data-bootstrapped`` flag on each host
-    // makes the call idempotent within a single render pass; cross-
-    // render fetch deduplication comes from the per-widget
-    // module-level state cache (``_weatherWidgetState``) plus its
-    // 5-minute staleness threshold.
-    mountSkillWidgets(container);
+    if (emptyEl) emptyEl.hidden = true;
+    container.innerHTML = skills.map((skill) => renderSkillCard(skill, reviewingSkills)).join('')
+        || '<div class="muted">No skills yet. Add one from the <b>Marketplace</b> tab.</div>';
     // v5: surface unread native-skill upgrade migrations so the
     // operator is told when the launcher silently rewrote an
     // installed skill (e.g. weather 0.1 script -> 0.2 extension).
@@ -580,39 +595,66 @@ function showBanner(message, tone) {
 }
 
 
-function attachActionHandlers(container, renderFn) {
+function attachActionHandlers(container, renderFn, reviewingSkills) {
+    // v5.2.3: the skill enable/disable control is an <input type="checkbox">
+    // (a real toggle switch) instead of a <button>. We listen for
+    // ``change`` so keyboard activation works the same as mouse.
+    container.addEventListener('change', async (event) => {
+        const target = event.target;
+        if (!target || !target.classList || !target.classList.contains('skills-toggle')) {
+            return;
+        }
+        const name = target.dataset.skill;
+        if (!name) return;
+        const wantsEnabled = Boolean(target.checked);
+        target.disabled = true;
+        try {
+            const result = await postWithFeedback(
+                `/api/skills/${encodeURIComponent(name)}/toggle`,
+                { enabled: wantsEnabled }
+            );
+            // v5.2.3 review-cycle fix: map the server-side action
+            // codes to friendly copy. The raw codes
+            // (extension_loaded / extension_unloaded / etc.) leaked
+            // jargon into the banner that defeats the rest of the
+            // UX rewrite.
+            const actionLabels = {
+                extension_loaded: 'live',
+                extension_unloaded: 'stopped',
+                extension_already_live: '',
+                extension_inactive: '',
+                extension_load_error: 'load failed',
+            };
+            const friendlyAction = actionLabels[result.extension_action];
+            const tail = friendlyAction ? ` — ${friendlyAction}` : '';
+            showBanner(`${name} ${wantsEnabled ? 'turned on' : 'turned off'}${tail}`, 'ok');
+            target.setAttribute('aria-checked', wantsEnabled ? 'true' : 'false');
+        } catch (err) {
+            // Roll the toggle back to the server-truth state if the
+            // request failed (e.g. 409 because grants are still missing).
+            target.checked = !wantsEnabled;
+            target.setAttribute('aria-checked', (!wantsEnabled).toString());
+            showBanner(`${name}: ${err.message || err}`, 'danger');
+        } finally {
+            target.disabled = false;
+            renderFn();
+        }
+    });
     container.addEventListener('click', async (event) => {
         const target = event.target.closest('button[data-skill]');
         if (!target) return;
+        if (target.classList.contains('skills-toggle')) {
+            // Toggle is now a checkbox handled above; ignore stale
+            // legacy button clicks if any sneak through.
+            return;
+        }
         const name = target.dataset.skill;
-        const wantsEnabled = target.dataset.enabled === 'false';
-        target.disabled = true;
-        try {
-            if (target.classList.contains('skills-toggle')) {
-                const result = await postWithFeedback(
-                    `/api/skills/${encodeURIComponent(name)}/toggle`,
-                    { enabled: wantsEnabled }
-                );
-                // v5 (Cycle 1 GPT-10 + Cycle 2 Gemini-2): clear the
-                // weather widget's cached error/result on disable AND
-                // bump the in-flight token so any in-flight refresh
-                // whose Promise resolves after we cleared the cache
-                // is rejected by the token-check guard. Without the
-                // token bump, a slow wttr.in fetch could repopulate
-                // ``lastResult`` post-disable and leak pre-disable
-                // data into the next enable.
-                if (name === 'weather' && !wantsEnabled) {
-                    _weatherWidgetState.lastResult = null;
-                    _weatherWidgetState.lastError = '';
-                    _weatherWidgetState.lastFetchedAt = 0;
-                    _weatherWidgetState.inflightToken += 1;
-                }
-                const tail = result.extension_action
-                    ? ` — ${result.extension_action}`
-                    : '';
-                showBanner(`${name} ${wantsEnabled ? 'enabled' : 'disabled'}${tail}`, 'ok');
-            } else if (target.classList.contains('skills-review')) {
-                showBanner(`${name}: running tri-model review (this may take ~30s)`, 'muted');
+        if (target.classList.contains('skills-review')) {
+            if (reviewingSkills.has(name)) return;
+            target.disabled = true;
+            reviewingSkills.add(name);
+            renderFn();
+            try {
                 const result = await postWithFeedback(
                     `/api/skills/${encodeURIComponent(name)}/review`,
                     {}
@@ -625,6 +667,57 @@ function attachActionHandlers(container, renderFn) {
                         : (result.error || result.status === 'fail') ? 'danger'
                         : 'warn'
                 );
+            } catch (err) {
+                showBanner(`${name}: ${err.message || err}`, 'danger');
+            } finally {
+                reviewingSkills.delete(name);
+                renderFn();
+            }
+            return;
+        }
+        target.disabled = true;
+        try {
+            if (target.classList.contains('skills-grant')) {
+                const keys = (target.dataset.keys || '').split(',').map((k) => k.trim()).filter(Boolean);
+                if (!keys.length) {
+                    showBanner(`${name}: no requested keys to grant`, 'warn');
+                } else {
+                    const ok = confirm(`Grant ${name} access to these core settings keys?\n\n${keys.join('\n')}\n\nThe desktop launcher will request a second confirmation. Only grant access to skills you trust.`);
+                    if (!ok) return;
+                    const bridge = window.pywebview?.api?.request_skill_key_grant;
+                    if (!bridge) {
+                        throw new Error('Skill key grants require the desktop launcher confirmation bridge.');
+                    }
+                    const result = await bridge(name, keys);
+                    if (!result?.ok) {
+                        throw new Error(result?.error || 'Skill key grant was cancelled.');
+                    }
+                    // v5.2.2: surface the cross-process reconcile
+                    // outcome so users know whether the just-granted
+                    // key actually reached the live extension. The
+                    // launcher posts to /api/skills/<name>/reconcile
+                    // after writing grants.json; if that call fails
+                    // the grant itself was persisted but the live
+                    // extension still needs a manual disable/enable.
+                    const reason = result.extension_reason;
+                    const action = result.extension_action;
+                    const loadError = result.load_error;
+                    if (reason === 'reconcile_call_failed') {
+                        showBanner(
+                            `${name}: grant saved, but server reconcile failed \u2014 toggle disable/enable to retry`,
+                            'warn'
+                        );
+                    } else if (loadError) {
+                        showBanner(
+                            `${name}: grant saved, but extension load failed: ${loadError}`,
+                            'warn'
+                        );
+                    } else if (action === 'extension_loaded') {
+                        showBanner(`${name}: grant saved and extension loaded`, 'ok');
+                    } else {
+                        showBanner(`${name}: requested key grants saved`, 'ok');
+                    }
+                }
             } else if (target.classList.contains('skills-update')) {
                 showBanner(`${name}: updating from ClawHub (this may take ~30s)`, 'muted');
                 const result = await postWithFeedback(
@@ -681,13 +774,19 @@ async function renderMarketplacePane() {
     if (pane.dataset.bootstrapped === 'true') {
         // Trigger a refresh so installed-state updates persist when the
         // operator switches between tabs.
-        const refresh = pane.querySelector('[data-mp-refresh]');
+        const refresh = pane.querySelector('[data-mp-search]');
         if (refresh) refresh.click();
         return;
     }
-    pane.dataset.bootstrapped = 'true';
-    const mod = await import('./marketplace.js');
-    mod.initMarketplace(pane);
+    pane.innerHTML = '<div class="muted">Loading marketplace…</div>';
+    try {
+        initMarketplace(pane);
+        pane.dataset.bootstrapped = 'true';
+    } catch (err) {
+        pane.dataset.bootstrapped = '';
+        pane.innerHTML = `<div class="skills-load-error">Failed to load marketplace UI: ${escapeHtml(err.message || err)}</div>`;
+        throw err;
+    }
 }
 
 
@@ -700,18 +799,24 @@ export function initSkills(ctx) {
     const emptyEl = document.getElementById('skills-empty');
     const runtimeModeEl = document.getElementById('skills-runtime-mode');
     const refreshBtn = document.getElementById('skills-refresh');
+    const reviewingSkills = new Set();
 
-    const renderFn = () => renderSkillsList(container, emptyEl, runtimeModeEl);
+    const renderFn = () => renderSkillsList(container, emptyEl, runtimeModeEl, reviewingSkills).catch((err) => {
+        container.innerHTML = `<div class="skills-load-error">Failed to render skills: ${escapeHtml(err.message || err)}</div>`;
+        console.warn('skills: render failed', err);
+    });
 
     refreshBtn.addEventListener('click', renderFn);
-    attachActionHandlers(container, renderFn);
+    attachActionHandlers(container, renderFn, reviewingSkills);
 
     document.querySelectorAll('.skills-tab').forEach((btn) => {
         btn.addEventListener('click', () => {
             const tabName = btn.dataset.tab;
             activateTab(tabName);
             if (tabName === 'marketplace') {
-                renderMarketplacePane();
+                renderMarketplacePane().catch((err) => {
+                    showBanner(`Marketplace failed: ${err.message || err}`, 'danger');
+                });
             }
         });
     });
@@ -721,4 +826,5 @@ export function initSkills(ctx) {
             renderFn();
         }
     });
+    renderFn();
 }

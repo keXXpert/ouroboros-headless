@@ -156,22 +156,16 @@ def test_skill_exec_refuses_when_unconfigured(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Runtime-mode gating: light blocks skill_exec
+# Runtime-mode semantics in v5.1.2 (Frame A):
+# ``light`` blocks repo self-modification but ALLOWS reviewed + enabled
+# skills to execute. The previous Frame-B regression (light blocking
+# skill_exec) is replaced by ``test_skill_exec_runs_in_light_mode`` in
+# tests/test_runtime_mode_gating.py — covering the positive path.
+# Light still blocks every escalation channel of the runtime_mode axis
+# itself; that is enforced by the chokepoint in
+# ``ouroboros.config.save_settings`` and ``_data_write`` settings.json
+# block, exercised in tests/test_runtime_mode_elevation.py.
 # ---------------------------------------------------------------------------
-
-
-def test_skill_exec_blocked_in_light_mode(tmp_path, monkeypatch):
-    skills_root = tmp_path / "skills"
-    skill_dir = _build_skill(skills_root, "hello")
-    ctx = _make_ctx(tmp_path)
-    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "hello")
-    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    result = skill_exec_mod._handle_skill_exec(
-        ctx, skill="hello", script="scripts/hello.py"
-    )
-    assert "SKILL_EXEC_BLOCKED" in result
-    assert "light" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +411,39 @@ def test_skill_exec_runs_reviewed_skill_successfully(tmp_path, monkeypatch):
     assert stdout["openrouter_leaked"] is False
 
 
+def test_skill_exec_runs_in_light_mode(tmp_path, monkeypatch):
+    """v5.1.2 Frame A: ``light`` allows reviewed + enabled skills to
+    execute. The privilege scope ``light`` controls is repo
+    self-modification and the runtime_mode elevation ratchet, NOT
+    owner-approved skills (skills already pass tri-model review +
+    enabled.json toggle + content-hash freshness + sandboxed
+    subprocess). This is the positive replacement for the deleted
+    Frame-B regression ``test_skill_exec_blocked_in_light_mode``.
+    """
+    skills_root = tmp_path / "skills"
+    skill_dir = _build_skill(
+        skills_root,
+        "hello",
+        script_body="import json; print(json.dumps({'ok': True}))\n",
+    )
+    ctx = _make_ctx(tmp_path)
+    _mark_reviewed_and_enabled(ctx.drive_root, skill_dir, "hello")
+
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+
+    raw = skill_exec_mod._handle_skill_exec(
+        ctx, skill="hello", script="scripts/hello.py"
+    )
+    # Must NOT be the v5.0.0 Frame-B sentinel.
+    assert "SKILL_EXEC_BLOCKED" not in raw
+    payload = json.loads(raw)
+    assert payload["skill"] == "hello"
+    assert payload["exit_code"] == 0
+    stdout_line = payload["stdout"].strip().splitlines()[-1]
+    assert json.loads(stdout_line) == {"ok": True}
+
+
 # ---------------------------------------------------------------------------
 # toggle_skill
 # ---------------------------------------------------------------------------
@@ -656,7 +683,7 @@ def test_toggle_skill_loads_and_unloads_extension_plugin(tmp_path, monkeypatch):
     assert enable_resp["extension_action"] == "extension_loaded"
     snap = extension_loader.snapshot()
     assert "ext_live" in snap["extensions"]
-    assert "ext.ext_live.t" in snap["tools"]
+    assert extension_loader.extension_surface_name("ext_live", "t") in snap["tools"]
 
     # Disable → the plugin is torn down.
     disable_resp = _json.loads(
@@ -710,7 +737,7 @@ def test_review_skill_reconciles_live_extension_after_review(tmp_path, monkeypat
     assert loaded is not None
     err = extension_loader.load_extension(loaded, lambda: {}, drive_root=ctx.drive_root)
     assert err is None, err
-    tool = extension_loader.get_tool("ext.ext_reviewed.t")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("ext_reviewed", "t"))
     assert tool is not None
     assert tool["handler"](None) == "v1"
 
@@ -743,7 +770,7 @@ def test_review_skill_reconciles_live_extension_after_review(tmp_path, monkeypat
     with patch.object(skill_exec_mod, "_review_skill_impl", side_effect=_fake_review):
         result = json.loads(skill_exec_mod._handle_review_skill(ctx, skill="ext_reviewed"))
     assert result["extension_action"] == "extension_loaded"
-    tool = extension_loader.get_tool("ext.ext_reviewed.t")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("ext_reviewed", "t"))
     assert tool is not None
     assert tool["handler"](None) == "v2"
 
@@ -865,11 +892,7 @@ def test_hard_timeout_ceiling_is_bounded():
 
 
 def test_env_denylist_blocks_secret_forwarding(tmp_path, monkeypatch):
-    """Phase 3 round 20 regression: even if a reviewed manifest
-    declares ``env_from_settings: [OPENROUTER_API_KEY]`` and the review
-    misses it, the runtime denylist must refuse to forward credentials
-    to the skill subprocess. Regression for "defense-in-depth beyond
-    reviewer perfection".
+    """Core settings keys are withheld unless a content-bound grant exists.
 
     Patch target note (round 21 fix): ``skill_exec.py`` imports
     ``load_settings`` from ``ouroboros.config`` as a bound alias via
@@ -903,16 +926,24 @@ def test_env_denylist_blocks_secret_forwarding(tmp_path, monkeypatch):
             skill_state_dir_path=skill_state_dir_path,
             skill_name="ok",
         )
-    # Forbidden keys are dropped even when the manifest explicitly asked for them.
+    # Core keys are dropped when no explicit owner grant exists.
     assert "OPENROUTER_API_KEY" not in env, (
-        "Runtime denylist must refuse to forward the OpenRouter key "
-        "regardless of manifest request."
+        "Runtime must refuse to forward the OpenRouter key without a grant."
     )
     assert "GITHUB_TOKEN" not in env
     assert "OUROBOROS_NETWORK_PASSWORD" not in env
     # Non-forbidden manifest-requested keys DO get forwarded so the
     # ``env_from_settings`` surface is not a no-op.
     assert env["SOME_OK_KEY"] == "visible-value"
+
+    with patch.object(se, "load_settings", return_value={"OPENROUTER_API_KEY": "sk-or-v1-GRANTED"}):
+        granted_env = se._scrub_env(
+            manifest_env_keys=["OPENROUTER_API_KEY"],
+            skill_state_dir_path=skill_state_dir_path,
+            skill_name="ok",
+            granted_keys=["OPENROUTER_API_KEY"],
+        )
+    assert granted_env["OPENROUTER_API_KEY"] == "sk-or-v1-GRANTED"
 
 
 def test_skill_exec_uses_shared_settings_denylist():

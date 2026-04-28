@@ -214,7 +214,7 @@ def test_api_extensions_index_marks_widget_only_extensions_as_ui_pending(
         permissions=["widget"],
         plugin=(
             "def register(api):\n"
-            "    api.register_ui_tab('weather', 'Weather', render={'kind': 'card'})\n"
+            "    api.register_ui_tab('weather', 'Weather', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'markdown', 'text': 'ok'}]})\n"
         ),
     )
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
@@ -238,9 +238,10 @@ def test_api_extensions_index_marks_widget_only_extensions_as_ui_pending(
         entry = next(s for s in data["skills"] if s["name"] == "ext_widget")
         assert entry["live_loaded"] is True
         assert entry["dispatch_live"] is False
-        assert entry["ui_tabs_pending"] == ["ext_widget:weather"]
-        assert data["live"]["ui_tabs"] == []
-        assert "ext_widget:weather" in data["live"]["ui_tabs_pending"]
+        assert entry["ui_tabs_pending"] == []
+        assert data["live"]["ui_tabs"][0]["key"] == "ext_widget:weather"
+        assert data["live"]["ui_tabs"][0]["render"]["kind"] == "declarative"
+        assert data["live"]["ui_tabs_pending"] == []
     finally:
         _stop_patches(patches)
 
@@ -565,6 +566,124 @@ def test_api_skill_toggle_rejects_non_boolean_enabled(tmp_path, monkeypatch):
         _stop_patches(patches)
 
 
+def test_api_skill_grants_requires_owner_bridge(tmp_path, monkeypatch):
+    skills_root = tmp_path / "skills"
+    _write_ext(
+        skills_root,
+        "grant_api",
+        permissions=["tool"],
+        plugin="def register(api):\n    pass\n",
+        env_from_settings=["OPENROUTER_API_KEY"],
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, _drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        resp = client.post(
+            "/api/skills/grant_api/grants",
+            json={"granted_keys": ["OPENROUTER_API_KEY"]},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["code"] == "owner_confirmation_required"
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_skill_reconcile_clears_cached_load_error(tmp_path, monkeypatch):
+    """v5.2.2 dual-track grants: ``POST /api/skills/<name>/reconcile``
+    is the loopback endpoint the desktop launcher pings after a
+    successful core-key grant. It must clear the server's cached
+    ``_load_failures`` entry and re-run ``load_extension`` so the
+    plugin picks up the freshly-granted key without forcing the user
+    to disable/enable.
+    """
+    from ouroboros import extension_loader
+    from ouroboros.skill_loader import (
+        SkillReviewState,
+        find_skill,
+        save_enabled,
+        save_review_state,
+        save_skill_grants,
+    )
+
+    skills_root = tmp_path / "skills"
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('n', lambda ctx: 'ok', description='n', schema={})\n"
+    )
+    _write_ext(
+        skills_root,
+        "reconcile_demo",
+        permissions=["tool", "read_settings"],
+        plugin=plugin,
+        env_from_settings=["OPENROUTER_API_KEY"],
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        first = find_skill(drive_root, "reconcile_demo", repo_path=str(skills_root))
+        assert first is not None
+        save_enabled(drive_root, "reconcile_demo", True)
+        save_review_state(
+            drive_root,
+            "reconcile_demo",
+            SkillReviewState(status="pass", content_hash=first.content_hash),
+        )
+        loaded = find_skill(drive_root, "reconcile_demo", repo_path=str(skills_root))
+        assert loaded is not None and loaded.enabled
+
+        # First load attempt — no grant on disk → fails with the new
+        # informative error and seeds ``_load_failures``.
+        err = extension_loader.load_extension(
+            loaded, lambda: {"OPENROUTER_API_KEY": "sk-secret"}, drive_root=drive_root,
+        )
+        assert err is not None
+        assert "missing owner grants" in err
+        with extension_loader._lock:
+            extension_loader._load_failures["reconcile_demo"] = (
+                extension_loader._ExtensionLoadFailure(
+                    content_hash=loaded.content_hash,
+                    skill_dir=str(loaded.skill_dir.resolve()),
+                    error=err,
+                )
+            )
+
+        # Owner grants → simulate the launcher writing grants.json.
+        save_skill_grants(
+            drive_root,
+            "reconcile_demo",
+            ["OPENROUTER_API_KEY"],
+            content_hash=loaded.content_hash,
+            requested_keys=["OPENROUTER_API_KEY"],
+        )
+
+        # The endpoint must clear the cached failure and load the plugin.
+        resp = client.post("/api/skills/reconcile_demo/reconcile")
+        assert resp.status_code == 200, resp.text
+        payload = resp.json()
+        assert payload["skill"] == "reconcile_demo"
+        assert payload["live_loaded"] is True
+        assert payload["extension_action"] == "extension_loaded"
+        with extension_loader._lock:
+            assert "reconcile_demo" in extension_loader._extensions
+            assert "reconcile_demo" not in extension_loader._load_failures
+    finally:
+        _stop_patches(patches)
+
+
+def test_api_skill_reconcile_rejects_missing_skill_name(tmp_path, monkeypatch):
+    client, _drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        # Starlette path params with empty trailing segment → 404 path,
+        # but explicit empty skill via direct call returns 400 from the
+        # endpoint's own validation.
+        resp = client.post("/api/skills/ /reconcile")
+        # Whitespace-only path param hits the endpoint with stripped
+        # empty name → 400.
+        assert resp.status_code == 400
+    finally:
+        _stop_patches(patches)
+
+
 def test_api_skill_review_offloads_to_thread_and_returns_outcome(tmp_path, monkeypatch):
     """Phase 5 regression: ``POST /api/skills/<skill>/review`` must
     trigger the tri-model review and return the outcome. The async
@@ -606,7 +725,7 @@ def test_api_skill_review_offloads_to_thread_and_returns_outcome(tmp_path, monke
 
 def test_ws_endpoint_dispatches_ext_prefixed_messages():
     """Phase 5 regression: server.py::ws_endpoint must route
-    ``type: "ext.*"`` WS messages through ``extension_loader.list_ws_handlers()``.
+    provider-safe extension WS messages through ``extension_loader.list_ws_handlers()``.
     AST-level check — the full runtime round-trip requires a live
     supervisor which is out of scope for this file."""
     import ast
@@ -615,7 +734,7 @@ def test_ws_endpoint_dispatches_ext_prefixed_messages():
     for node in ast.walk(tree):
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "ws_endpoint":
             body = ast.unparse(node)
-            assert "ext." in body, "ws_endpoint has no ext.* dispatch branch"
+            assert "parse_extension_surface_name" in body, "ws_endpoint has no extension dispatch branch"
             assert "list_ws_handlers" in body, (
                 "ws_endpoint does not look up extension WS handlers via "
                 "``extension_loader.list_ws_handlers``."
@@ -661,11 +780,48 @@ def test_ws_endpoint_reconciles_and_unloads_not_live_extension(tmp_path, monkeyp
         save_enabled(drive_root, "ext_ws_guarded", False)
 
         with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "ext.ext_ws_guarded.message"}))
+            ws.send_text(json.dumps({"type": extension_loader.extension_surface_name("ext_ws_guarded", "message")}))
             reply = json.loads(ws.receive_text())
         assert reply["type"] == "log"
         assert "not live" in reply["data"]["message"]
         assert "ext_ws_guarded" not in extension_loader.snapshot()["extensions"]
+    finally:
+        _stop_patches(patches)
+
+
+def test_ws_endpoint_dispatches_first_message_after_lazy_load(tmp_path, monkeypatch):
+    from ouroboros import extension_loader
+    from ouroboros.skill_loader import (
+        SkillReviewState,
+        compute_content_hash,
+        save_enabled,
+        save_review_state,
+    )
+
+    skills_root = tmp_path / "skills"
+    plugin = (
+        "async def _handler(payload):\n"
+        "    return {'acked': payload.get('payload')}\n"
+        "def register(api):\n"
+        "    api.register_ws_handler('message', _handler)\n"
+    )
+    skill_dir = _write_ext(skills_root, "ext_ws_lazy", permissions=["ws_handler"], plugin=plugin)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    client, drive_root, patches = _make_client(tmp_path, monkeypatch)
+    try:
+        content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+        save_enabled(drive_root, "ext_ws_lazy", True)
+        save_review_state(
+            drive_root,
+            "ext_ws_lazy",
+            SkillReviewState(status="pass", content_hash=content_hash),
+        )
+        extension_loader.unload_extension("ext_ws_lazy")
+        msg_type = extension_loader.extension_surface_name("ext_ws_lazy", "message")
+        with client.websocket_connect("/ws") as ws:
+            ws.send_text(json.dumps({"type": msg_type, "payload": "first"}))
+            reply = json.loads(ws.receive_text())
+        assert reply == {"type": f"{msg_type}.reply", "data": {"acked": "first"}}
     finally:
         _stop_patches(patches)
 
@@ -686,6 +842,7 @@ def test_ws_endpoint_surfaces_extension_load_error(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
     client, drive_root, patches = _make_client(tmp_path, monkeypatch)
     try:
+        from ouroboros import extension_loader
         from ouroboros.skill_loader import SkillReviewState, compute_content_hash, save_enabled, save_review_state
 
         content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
@@ -697,7 +854,7 @@ def test_ws_endpoint_surfaces_extension_load_error(tmp_path, monkeypatch):
         )
 
         with client.websocket_connect("/ws") as ws:
-            ws.send_text(json.dumps({"type": "ext.ext_ws_broken.message"}))
+            ws.send_text(json.dumps({"type": extension_loader.extension_surface_name("ext_ws_broken", "message")}))
             reply = json.loads(ws.receive_text())
         assert reply["type"] == "log"
         assert "failed to go live" in reply["data"]["message"]
@@ -707,7 +864,7 @@ def test_ws_endpoint_surfaces_extension_load_error(tmp_path, monkeypatch):
 
 def test_tool_registry_execute_dispatches_ext_tool(tmp_path, monkeypatch):
     """Phase 5 regression: ``ToolRegistry.execute`` falls back to
-    ``extension_loader.get_tool`` for ``ext.*`` names, but only for
+    ``extension_loader.get_tool`` for extension names, but only for
     reviewed/live extensions that are surfaced through the normal
     registry schema lookup."""
     from ouroboros.tools import registry as tools_registry
@@ -745,12 +902,19 @@ def test_tool_registry_execute_dispatches_ext_tool(tmp_path, monkeypatch):
     assert err is None, err
     try:
         tmp_reg = tools_registry.ToolRegistry(repo_dir=tmp_path, drive_root=drive_root)
-        schema = tmp_reg.get_schema_by_name("ext.testskill.echo")
+        tool_name = extension_loader.extension_surface_name("testskill", "echo")
+        schema = tmp_reg.get_schema_by_name(tool_name)
         assert schema is not None
-        assert schema["function"]["name"] == "ext.testskill.echo"
-        result = tmp_reg.execute("ext.testskill.echo", {"who": "phase5"})
-        assert result == "hello phase5"
+        assert schema["function"]["name"] == tool_name
+        result = tmp_reg.execute(tool_name, {"who": "phase5"})
+        # v5.1.2 iter-2: extension dispatch now goes through
+        # ``ouroboros.safety.check_safety``. In test envs without a
+        # safety backend, the supervisor returns a visible
+        # ``SAFETY_WARNING`` prefix while still letting the call run
+        # (fail-open). Assert the handler ran and produced its output;
+        # the warning prefix is acceptable.
+        assert "hello phase5" in result, result
         # get_timeout honours the extension's declared timeout.
-        assert tmp_reg.get_timeout("ext.testskill.echo") == 10
+        assert tmp_reg.get_timeout(tool_name) == 10
     finally:
         extension_loader.unload_extension("testskill")

@@ -95,6 +95,22 @@ def test_light_mode_still_allows_read_only_tools(tmp_path, monkeypatch):
     assert "LIGHT_MODE_BLOCKED" not in result
 
 
+def test_light_mode_does_not_block_skill_exec_at_registry_layer(tmp_path, monkeypatch):
+    """v5.1.2 Frame A: ``skill_exec`` is NOT in ``_REPO_MUTATION_TOOLS``.
+    The blanket light-mode block at ``ToolRegistry.execute`` does not
+    fire on skill-lifecycle tools. (The full positive happy-path with
+    a real subprocess lives in
+    ``tests/test_skill_exec.py::test_skill_exec_runs_in_light_mode``.)
+    """
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    reg = _registry(tmp_path)
+    # Call with empty args: the tool reaches its own validation
+    # (SKILL_EXEC_ERROR) rather than being rejected by the runtime-mode gate.
+    result = reg.execute("skill_exec", {})
+    assert "LIGHT_MODE_BLOCKED" not in result
+    assert "SKILL_EXEC_BLOCKED" not in result
+
+
 # ---------------------------------------------------------------------------
 # Advanced mode: protected core/contract/release surfaces are blocked
 # ---------------------------------------------------------------------------
@@ -357,15 +373,23 @@ def test_advanced_mode_blocks_runshell_protected_backslash_path(tmp_path, monkey
     assert "SAFETY_VIOLATION" in result
 
 
-def test_light_mode_blocks_extension_tool_dispatch(tmp_path, monkeypatch):
+def test_light_mode_allows_extension_tool_dispatch(tmp_path, monkeypatch):
+    """v5.1.2 Frame A: ``light`` lets reviewed + enabled extension tools
+    dispatch. The privilege scope ``light`` controls is repo
+    self-modification and the runtime_mode elevation ratchet, NOT
+    owner-approved skills. The previous regression that asserted a
+    ``LIGHT_MODE_BLOCKED`` sentinel is intentionally inverted here: the
+    handler's return value reaches the caller as the tool result.
+    """
     from ouroboros import extension_loader
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
+    tool_name = extension_loader.extension_surface_name("testskill", "echo")
     with extension_loader._lock:
-        extension_loader._tools["ext.testskill.echo"] = {
-            "name": "ext.testskill.echo",
-            "handler": lambda ctx, **kwargs: "should not run",
+        extension_loader._tools[tool_name] = {
+            "name": tool_name,
+            "handler": lambda ctx, **kwargs: "extension-tool-ran",
             "description": "echo",
             "schema": {},
             "timeout_sec": 10,
@@ -375,12 +399,14 @@ def test_light_mode_blocks_extension_tool_dispatch(tmp_path, monkeypatch):
     unloaded: list[str] = []
     monkeypatch.setattr(extension_loader, "unload_extension", unloaded.append)
     try:
-        result = reg.execute("ext.testskill.echo", {})
-        assert "LIGHT_MODE_BLOCKED" in result
-        assert unloaded == ["testskill"]
+        result = reg.execute(tool_name, {})
+        assert "LIGHT_MODE_BLOCKED" not in result
+        assert "extension-tool-ran" in result
+        # Extension stays loaded — no automatic unload triggered by light.
+        assert unloaded == []
     finally:
         with extension_loader._lock:
-            extension_loader._tools.pop("ext.testskill.echo", None)
+            extension_loader._tools.pop(tool_name, None)
 
 
 @pytest.mark.parametrize(

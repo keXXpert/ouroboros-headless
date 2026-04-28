@@ -44,7 +44,7 @@ Rules in this file must not contradict BIBLE.md.
 
 - **Language:** All code identifiers, comments, docstrings, and commit messages are in English.
 - **Style:** Python PEP 8. Modules and variables — `snake_case`. Classes — `PascalCase`. Constants — `UPPER_SNAKE_CASE`.
-- **Self-explanatory names** over abbreviations. A name should tell you what the thing *does*, not just what it *is*. Derived from P4 (Authenticity).
+- **Self-explanatory names** over abbreviations. A name should tell you what the thing *does*, not just what it *is*. Derived from P6 (Authenticity & Reality Discipline).
 
 ### Entity Types
 
@@ -87,9 +87,9 @@ Not every layer is required for every operation. Simple cases (e.g., `repo_read`
 
 ## Module Size & Complexity
 
-Derived from P5 (Minimalism): entire codebase fits in one context window.
+Derived from P7 (Minimalism): entire codebase fits in one context window.
 
-- Module target: ~1000 lines. Crossing that line is P5 pressure and should trigger extraction or an explicit justification.
+- Module target: ~1000 lines. Crossing that line is P7 pressure and should trigger extraction or an explicit justification.
 - Module hard gate: 1600 lines for non-grandfathered modules in `tests/test_smoke.py`. Grandfathered (`GRANDFATHERED_OVERSIZED_MODULES` in `ouroboros/review.py`): `llm.py`, `claude_advisory_review.py`, `review_state.py` — split deferred until each surface stabilises.
 - Method target: <150 lines. Crossing that line is a decomposition signal, not an automatic failure by itself.
 - Method hard gate: 300 lines in `tests/test_smoke.py`.
@@ -193,7 +193,7 @@ replacement — then `advisory_pre_review`, then `repo_commit` immediately on th
 final diff.
 
 The full pre-commit review checklists live in **`docs/CHECKLISTS.md`** —
-the single source of truth (Bible P5: DRY).
+the single source of truth (Bible P7: DRY).
 
 This section defines what "DEVELOPMENT.md compliance" means in practice — it is the
 detailed expansion of the `development_compliance` item in `docs/CHECKLISTS.md`.
@@ -217,7 +217,7 @@ Before every commit, verify the following:
 - [ ] No method exceeds the practical target (150 lines) or the hard gate (300 lines)
 - [ ] Total Python function count stays under the current smoke hard gate (consult `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` for the active value; bump with a comment if a feature requires more headroom)
 - [ ] No function has more than 8 parameters
-- [ ] No gratuitous abstract layers (Bible P5)
+- [ ] No gratuitous abstract layers (Bible P7)
 
 #### Structural Rules
 - [ ] New Tool? `get_tools()` exports it using the `ToolEntry` pattern from `registry.py`, AND an explicit entry is added to `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones). Without the policy entry the tool falls through to `DEFAULT_POLICY = POLICY_CHECK` and pays a light-model LLM call per invocation, and the `test_tool_policy_covers_all_builtin_tools` invariant will fail.
@@ -290,9 +290,9 @@ border: 1px solid rgba(255, 255, 255, 0.06–0.12);
 ```
 
 Floating chat chrome that overlaps transcript text (header, status badge, attachment
-preview, input fade) must keep enough opacity or blur in the text-bearing zones that
-underlying message text cannot read through labels. Use the same glass range above
-instead of fully transparent gradients behind visible text.
+preview, input dock) must keep enough opacity or blur in the text-bearing zones that
+underlying message text cannot read through labels. Do not add bottom transcript
+fade overlays; keep the last message readable and reserve space with layout/padding.
 
 ### Accent colors
 
@@ -340,3 +340,107 @@ Existing classes (`.stat-card`, `.page-header`, `.about-*`, `.costs-*`) cover co
 Add new classes to `web/style.css` when needed.
 Before staging any `web/modules/*.js` file: `grep -n "\.style\." web/modules/*.js`
 and fix any hits.
+
+### Declarative widget UI
+
+Extension widgets must use host-owned declarative render schemas, not
+skill-provided JavaScript. `web/modules/widgets.js` is the single host for
+`register_ui_tab` declarations: legacy `iframe` remains sandboxed with no
+relaxed tokens, legacy `inline_card` remains weather-shaped, and
+`kind: "declarative"` / `schema_version: 1` covers forms, actions, markdown,
+JSON, key/value summaries, tables, progress, files, galleries, and
+image/audio/video media. New widget capabilities should extend that schema and
+its tests rather than adding per-skill renderer modules.
+
+Rules for widget changes:
+
+- Escape every untrusted string with `escapeHtml`; use DOMPurify only for
+  markdown blocks.
+- Media sources must be extension routes under `/api/extensions/<skill>/...`
+  or explicitly safe `data:` URLs for image/audio/video MIME types.
+- Do not load arbitrary JS modules from skill directories into the SPA origin.
+- Add/update `tests/test_widgets_ui_static.py` for every new component kind or
+  media policy.
+
+---
+
+## Build & CI
+
+### GitHub Actions: secrets in step-level `if:` conditions
+
+GitHub Actions **rejects** `secrets.*` references inside step-level `if:`
+expressions with `Unrecognized named-value: 'secrets'`. The workflow file
+fails to parse and the job never runs. Step-level `env:` blocks **are also
+not visible to that step's own `if:`** — only job-level `env:` is.
+
+When a step needs to gate on whether a secret is configured, **map the
+secret into the build job's `env:` block, then reference `env.*` in the
+step `if:`**. The step itself can then either use the env var directly
+(it inherits from the job) or assume it is present.
+
+```yaml
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      # job-level: visible to step-level `if:` via env.*
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+    steps:
+      - name: Import Apple signing certificate
+        # ✅ env.* — visible inside step-level if
+        if: env.BUILD_CERTIFICATE_BASE64 != '' && env.P12_PASSWORD != ''
+        run: |
+          echo "${BUILD_CERTIFICATE_BASE64}" | base64 -d > cert.p12
+          security import cert.p12 -P "${P12_PASSWORD}" ...
+      - name: Cleanup keychain
+        if: always() && env.BUILD_CERTIFICATE_BASE64 != ''
+        run: security delete-keychain ...
+```
+
+```yaml
+# ❌ WRONG — workflow fails to parse
+- name: Bad
+  if: secrets.BUILD_CERTIFICATE_BASE64 != ''   # parse error
+  env:                                          # not visible to this step's if:
+    P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+```
+
+This pattern is enforced by `tests/test_build_scripts.py::TestMacOSSigning::
+test_ci_uses_env_context_for_condition`, which parses every `if:` block in
+`.github/workflows/ci.yml` (including multi-line continuations) and asserts
+no occurrence of `secrets.` ever appears inside one.
+
+### Apple signing & notarization (macOS Build job)
+
+When `BUILD_CERTIFICATE_BASE64`, `P12_PASSWORD`, `KEYCHAIN_PASSWORD`, and
+`APPLE_TEAM_ID` are configured as repository secrets, the macOS build job
+imports the Developer ID certificate into a temporary keychain and runs
+`bash build.sh` — `build.sh` then signs the `.app` and the `.dmg` using
+the env-overridable `SIGN_IDENTITY`. Each Apple secret is mapped at the
+build job's `env:` block with a `${{ matrix.os == 'macos-latest' && secrets.X || '' }}`
+guard so the Apple credentials reach the macOS matrix shard only; Linux
+and Windows sibling shards (running `build_linux.sh` / `build_windows.ps1`,
+neither of which needs Apple creds) receive empty strings. When `APPLE_ID` and
+`APPLE_APP_SPECIFIC_PASSWORD` are also present, `build.sh` runs
+`xcrun notarytool submit ... --wait` followed by `xcrun stapler staple` to
+attach the notarization ticket; otherwise the entire notarization block is
+skipped and the DMG ships **signed but not notarized** (users still need
+right-click → **Open** on first launch). The stapler call is wrapped in
+its own guard so a transient stapler failure after a successful notarytool
+submission becomes a soft warning rather than a hard build failure (the
+DMG is genuinely notarized — Gatekeeper just fetches the ticket online on
+first launch instead of from the embedded staple). The `notarytool submit`
+call is wrapped the same way: an Apple-side outage / wrong-credential typo
+prints a `WARNING` and lets the DMG ship signed-but-not-notarized, instead
+of aborting the build under `set -e` and silently dropping the macOS
+artifact from the release. A single `NOTARIZE_OUTCOME` enum (`success` /
+`staple_failed` / `submit_failed` / `unconfigured`) drives the build's
+final summary line so the WARN message and the summary always agree on
+the actual artifact state, plus a defensive `*)` arm so any future enum
+drift is loud. The `Cleanup keychain`
+step runs with `if: always() && matrix.os == 'macos-latest' && env.BUILD_CERTIFICATE_BASE64 != ''`
+— `always()` ensures cleanup fires on build failures too, the `matrix.os`
+gate keeps the bash-only `security` invocation off Linux/Windows shards,
+and the env guard skips when no keychain was created (no signing secrets).
+Signing material never persists across runs.

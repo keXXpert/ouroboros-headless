@@ -485,6 +485,19 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+/* Generic disabled segmented-button style. Runtime mode is interactive in
+   desktop builds, but other segmented controls may still disable buttons. */
+.settings-effort-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+.settings-effort-btn:disabled:hover {
+    background: rgba(255, 255, 255, 0.04);
+    border-color: rgba(255, 255, 255, 0.08);
+    color: var(--text-secondary);
+    transform: none;
+}
+
 
 [data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"].active,
 [data-enforcement-group] .settings-effort-btn[data-effort-value="advisory"]:hover {

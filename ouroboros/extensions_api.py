@@ -25,7 +25,11 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from ouroboros.extension_loader import list_routes, snapshot
-from ouroboros.skill_loader import discover_skills, find_skill
+from ouroboros.skill_loader import (
+    discover_skills,
+    find_skill,
+    grant_status_for_skill,
+)
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +81,7 @@ async def api_extensions_index(request: Request) -> JSONResponse:
     try:
         from ouroboros.config import get_skills_repo_path
 
-        from ouroboros.extension_loader import runtime_state_for_skill_name
+        from ouroboros.extension_loader import extension_name_prefix, runtime_state_for_skill_name
 
         drive_root = _request_drive_root(request)
         repo_path = get_skills_repo_path()
@@ -98,7 +102,7 @@ async def api_extensions_index(request: Request) -> JSONResponse:
         }
 
         def _live_tool_count(skill_name: str) -> int:
-            prefix = f"ext.{skill_name}."
+            prefix = extension_name_prefix(skill_name)
             return sum(1 for name in live_snapshot.get("tools", []) if str(name).startswith(prefix))
 
         def _live_route_count(skill_name: str) -> int:
@@ -106,7 +110,7 @@ async def api_extensions_index(request: Request) -> JSONResponse:
             return sum(1 for name in live_snapshot.get("routes", []) if str(name).startswith(prefix))
 
         def _live_ws_count(skill_name: str) -> int:
-            prefix = f"ext.{skill_name}."
+            prefix = extension_name_prefix(skill_name)
             return sum(1 for name in live_snapshot.get("ws_handlers", []) if str(name).startswith(prefix))
 
         def _pending_ui_tabs(skill_name: str) -> list[str]:
@@ -135,21 +139,16 @@ async def api_extensions_index(request: Request) -> JSONResponse:
         #   ``installed_at`` / ``updated_at`` (internally generated).
         #   These let the operator inspect what's already on disk
         #   without re-enabling the marketplace surface.
-        # - **Gated on ``OUROBOROS_CLAWHUB_ENABLED``**: the
-        #   *registry-controlled* fields ``homepage``, ``license``,
+        # - Registry-controlled fields ``homepage``, ``license``,
         #   ``primary_env``, ``adapter_warnings``, ``registry_url``.
         #   These can carry attacker-shaped strings written into
-        #   provenance at install time; they vanish from the wire
-        #   when the operator turns the marketplace off.
+        #   provenance at install time, so the UI must keep rendering
+        #   them as text/safe links.
         try:
             from ouroboros.marketplace.provenance import read_provenance
         except Exception:  # pragma: no cover — defensive
             read_provenance = lambda *_a, **_kw: None  # type: ignore[assignment]
-        try:
-            from ouroboros.config import get_clawhub_enabled
-            marketplace_enabled = bool(get_clawhub_enabled())
-        except Exception:  # pragma: no cover — defensive
-            marketplace_enabled = False
+        marketplace_enabled = True
 
         catalog = []
         for s in skills:
@@ -172,11 +171,13 @@ async def api_extensions_index(request: Request) -> JSONResponse:
                     or _live_ws_count(s.name)
                 ),
                 "ui_tabs_pending": _pending_ui_tabs(s.name),
+                "review_findings": list(s.review.findings or []),
+                "grants": grant_status_for_skill(drive_root, s),
                 # v4.50: surface the discovery source so the Skills tab
                 # can render a clawhub badge + Update/Uninstall buttons
                 # for marketplace-installed skills. Without this the
                 # /api/extensions catalogue would silently mislabel
-                # clawhub skills as "native" (P5 honesty regression).
+                # clawhub skills as "native" (P6 honesty regression).
                 "source": s.source,
             }
             if s.source == "clawhub":
@@ -343,7 +344,7 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
     via HTTP.
     """
     from ouroboros.config import get_skills_repo_path, load_settings
-    from ouroboros.skill_loader import find_skill, save_enabled
+    from ouroboros.skill_loader import find_skill, grant_status_for_skill, save_enabled
     from ouroboros import extension_loader
 
     skill_name = str(request.path_params.get("skill") or "").strip()
@@ -368,6 +369,29 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
             {"error": f"cannot enable: {loaded.load_error}"},
             status_code=400,
         )
+    if enabled:
+        stale = loaded.review.is_stale_for(loaded.content_hash)
+        grants = grant_status_for_skill(drive_root, loaded)
+        if loaded.review.status != "pass" or stale:
+            return JSONResponse(
+                {
+                    "error": "cannot enable until review status is fresh PASS",
+                    "review_status": loaded.review.status,
+                    "review_stale": stale,
+                    "grants": grants,
+                },
+                status_code=409,
+            )
+        if not grants.get("all_granted", True):
+            return JSONResponse(
+                {
+                    "error": "cannot enable until requested key grants are approved",
+                    "review_status": loaded.review.status,
+                    "review_stale": stale,
+                    "grants": grants,
+                },
+                status_code=409,
+            )
     if not enabled and collision_load_error:
         action = None
         if loaded.name in extension_loader.snapshot()["extensions"]:
@@ -404,6 +428,8 @@ async def api_skill_toggle(request: Request) -> JSONResponse:
             "skill": loaded.name,
             "enabled": enabled,
             "review_status": loaded.review.status,
+            "review_stale": loaded.review.is_stale_for(loaded.content_hash),
+            "grants": grant_status_for_skill(drive_root, loaded),
             "extension_action": action,
             "extension_reason": live_reason,
         }
@@ -462,6 +488,31 @@ async def api_skill_review(request: Request) -> JSONResponse:
         repo_path=repo_path,
         retry_load_error=True,
     )
+    try:
+        from supervisor.message_bus import send_with_budget
+
+        findings = outcome.findings or []
+        top_findings = []
+        for item in findings[:5]:
+            if isinstance(item, dict):
+                label = item.get("item") or item.get("check") or item.get("title") or "finding"
+                verdict = item.get("verdict") or item.get("severity") or ""
+                reason = item.get("reason") or item.get("message") or ""
+                top_findings.append(f"- {verdict} {label}: {reason}".strip())
+        details = "\n".join(top_findings) if top_findings else "- No reviewer findings."
+        send_with_budget(
+            0,
+            (
+                f"### Skill review: `{outcome.skill_name}`\n"
+                f"Status: `{outcome.status}`\n\n"
+                f"{details}\n\n"
+                "Full findings are available in the Skills page."
+            ),
+            fmt="markdown",
+            task_id="api_skill_review",
+        )
+    except Exception:
+        log.debug("Could not publish skill review summary to chat", exc_info=True)
     return JSONResponse(
         {
             "skill": outcome.skill_name,
@@ -476,10 +527,67 @@ async def api_skill_review(request: Request) -> JSONResponse:
     )
 
 
+async def api_skill_grants(request: Request) -> JSONResponse:
+    """Reject direct grant writes; desktop launcher owns this boundary."""
+    return JSONResponse(
+        {
+            "error": "key grants require desktop launcher confirmation",
+            "code": "owner_confirmation_required",
+        },
+        status_code=403,
+    )
+
+
+async def api_skill_reconcile(request: Request) -> JSONResponse:
+    """POST /api/skills/<skill>/reconcile — re-run the extension load gate.
+
+    The desktop launcher owns the grant-write path because it is the only
+    surface that can summon the native confirmation dialog. After the
+    launcher persists ``grants.json`` to disk it cannot reach the
+    server's in-process extension registry directly: launcher.py and
+    server.py run as separate OS processes, each with its own copy of
+    ``extension_loader._extensions`` / ``_load_failures``. The launcher
+    therefore POSTs this loopback endpoint after a successful grant so
+    the agent server clears any cached load failure and re-imports the
+    plugin with the fresh ``granted_keys`` set, lifting the user out of
+    the disable/enable workaround that previous releases required.
+
+    Idempotent: any caller (UI refresh, agent, launcher) may invoke
+    this without side effects beyond reconciling the named skill.
+    """
+    from ouroboros.config import get_skills_repo_path, load_settings
+    from ouroboros import extension_loader
+
+    skill_name = str(request.path_params.get("skill") or "").strip()
+    if not skill_name:
+        return JSONResponse({"error": "missing skill name"}, status_code=400)
+
+    drive_root = _request_drive_root(request)
+    repo_path = get_skills_repo_path()
+    state = extension_loader.reconcile_extension(
+        skill_name,
+        drive_root,
+        load_settings,
+        repo_path=repo_path,
+        retry_load_error=True,
+    )
+    return JSONResponse(
+        {
+            "skill": skill_name,
+            "extension_action": state.get("action"),
+            "extension_reason": state.get("reason"),
+            "live_loaded": bool(state.get("live_loaded")),
+            "load_error": state.get("load_error"),
+        }
+    )
+
+
 __all__ = [
     "api_extensions_index",
     "api_extension_manifest",
     "api_extension_dispatch",
     "api_skill_toggle",
     "api_skill_review",
+    "api_skill_grants",
+    "api_skill_reconcile",
 ]

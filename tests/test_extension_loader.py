@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from typing import Any, Dict
 
 import pytest
@@ -168,10 +169,31 @@ def test_load_extension_registers_tool(tmp_path):
     loaded, _, _ = _prepare_extension(tmp_path, "ext1", plugin, permissions=["tool"])
     err = extension_loader.load_extension(loaded, lambda: {})
     assert err is None, err
-    tool = extension_loader.get_tool("ext.ext1.echo")
+    tool_name = extension_loader.extension_surface_name("ext1", "echo")
+    tool = extension_loader.get_tool(tool_name)
     assert tool is not None
-    assert tool["name"] == "ext.ext1.echo"
+    assert tool["name"] == tool_name
     assert callable(tool["handler"])
+
+
+def test_extension_surface_names_are_provider_safe_without_renaming_skill_identity():
+    from ouroboros.skill_loader import _sanitize_skill_name
+
+    dotted = "foo.bar"
+    unicode_name = "погода"
+    dotted_tool = extension_loader.extension_surface_name(dotted, "fetch")
+    unicode_tool = extension_loader.extension_surface_name(unicode_name, "fetch")
+    generated_token_twin = "foo_bar_336d1b3d72"
+
+    assert _sanitize_skill_name(dotted) == dotted
+    assert _sanitize_skill_name("foo_bar") == "foo_bar"
+    assert dotted_tool != extension_loader.extension_surface_name("foo_bar", "fetch")
+    assert dotted_tool != extension_loader.extension_surface_name(generated_token_twin, "fetch")
+    assert extension_loader.extension_surface_name("foo", "bar_baz") != extension_loader.extension_surface_name("foo_bar", "baz")
+    for tool_name in (dotted_tool, unicode_tool):
+        assert re.match(r"^[A-Za-z0-9_-]{1,64}$", tool_name)
+        assert "." not in tool_name
+        assert extension_loader.parse_extension_surface_name(tool_name) is not None
 
 
 def test_load_extension_rejects_outward_symlink_in_skill_tree(tmp_path):
@@ -225,7 +247,7 @@ def test_load_extension_rejects_outward_symlink_in_skill_tree(tmp_path):
     err = extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root)
     assert err is not None
     assert "symlink" in err.lower()
-    assert extension_loader.get_tool("ext.symlinked.echo") is None
+    assert extension_loader.get_tool(extension_loader.extension_surface_name("symlinked", "echo")) is None
 
 
 def test_load_extension_registers_route_with_prefix(tmp_path):
@@ -316,9 +338,52 @@ def test_load_extension_supports_nested_entry_relative_imports(tmp_path):
     assert loaded is not None
     err = extension_loader.load_extension(loaded, lambda: {})
     assert err is None, err
-    tool = extension_loader.get_tool("ext.ext_nested.t")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("ext_nested", "t"))
     assert tool is not None
     assert tool["handler"](None) == "nested-ok"
+
+
+def test_unload_dotted_prefix_skill_does_not_break_neighbor_imports(tmp_path):
+    repo_root = tmp_path / "skills"
+    foo_dir = _write_ext_skill(
+        repo_root,
+        "foo",
+        permissions=["tool"],
+        plugin_body=(
+            "def register(api):\n"
+            "    api.register_tool('t', lambda ctx: 'foo', description='', schema={})\n"
+        ),
+    )
+    dotted_dir = _write_ext_skill(
+        repo_root,
+        "foo.bar",
+        permissions=["tool"],
+        plugin_body=(
+            "def _lazy(ctx):\n"
+            "    from .helper import VALUE\n"
+            "    return VALUE\n"
+            "def register(api):\n"
+            "    api.register_tool('lazy', _lazy, description='', schema={})\n"
+        ),
+    )
+    (dotted_dir / "helper.py").write_text("VALUE = 'still-live'\n", encoding="utf-8")
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    for name, skill_dir in (("foo", foo_dir), ("foo.bar", dotted_dir)):
+        save_enabled(drive_root, name, True)
+        save_review_state(
+            drive_root,
+            name,
+            SkillReviewState(status="pass", content_hash=compute_content_hash(skill_dir, manifest_entry="plugin.py")),
+        )
+        loaded = find_skill(drive_root, name, repo_path=str(repo_root))
+        assert loaded is not None
+        assert extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root) is None
+
+    extension_loader.unload_extension("foo")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("foo.bar", "lazy"))
+    assert tool is not None
+    assert tool["handler"](None) == "still-live"
 
 
 def test_load_extension_registers_ws_handler_with_namespace(tmp_path):
@@ -332,26 +397,119 @@ def test_load_extension_registers_ws_handler_with_namespace(tmp_path):
     err = extension_loader.load_extension(loaded, lambda: {})
     assert err is None, err
     handlers = extension_loader.list_ws_handlers()
-    assert "ext.ws1.message" in handlers
+    assert extension_loader.extension_surface_name("ws1", "message") in handlers
 
 
-def test_register_ui_tab_stays_pending_until_host_exists(tmp_path):
+def test_register_ui_tab_surfaces_hostable_widget(tmp_path):
     loaded, _, _ = _prepare_extension(
         tmp_path,
         "uiwait",
         "def register(api):\n"
-        "    api.register_ui_tab('weather', 'Weather', render={'kind': 'card'})\n",
+        "    api.register_ui_tab('weather', 'Weather', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'markdown', 'text': 'ok'}]})\n",
         permissions=["widget"],
     )
     err = extension_loader.load_extension(loaded, lambda: {})
     assert err is None, err
     snap = extension_loader.snapshot()
-    assert snap["ui_tabs"] == []
-    assert snap["ui_tabs_pending"] == ["uiwait:weather"]
+    assert snap["ui_tabs_pending"] == []
+    assert snap["ui_tabs"][0]["key"] == "uiwait:weather"
+    assert snap["ui_tabs"][0]["render"]["kind"] == "declarative"
 
     extension_loader.unload_extension("uiwait")
     snap = extension_loader.snapshot()
-    assert snap["ui_tabs_pending"] == []
+    assert snap["ui_tabs"] == []
+
+
+def test_register_ui_tab_rejects_unsupported_render_kind(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "badui",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'script_module', 'src': 'x.js'})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "unsupported" in err
+
+
+def test_register_ui_tab_rejects_bad_declarative_component(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "baddecl",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'script'}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "unsupported type" in err
+
+
+def test_register_ui_tab_rejects_declarative_form_without_route(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "badform",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'form', 'fields': [{'name': 'q'}]}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "requires route or api_route" in err
+
+
+def test_register_ui_tab_rejects_declarative_table_without_columns(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "badtable",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'table', 'path': 'rows'}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "columns" in err
+
+
+def test_register_ui_tab_rejects_declarative_media_without_source(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "badmedia",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'image', 'label': 'Preview'}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "media source" in err
+
+
+def test_register_ui_tab_rejects_bad_gallery_item(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "badgallery",
+        "def register(api):\n"
+        "    api.register_ui_tab('bad', 'Bad', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'gallery', 'items': [None]}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is not None
+    assert "item 0 must be an object" in err
+
+
+def test_register_ui_tab_accepts_declarative_poll_component(tmp_path):
+    loaded, _, _ = _prepare_extension(
+        tmp_path,
+        "pollui",
+        "def register(api):\n"
+        "    api.register_ui_tab('poll', 'Poll', render={'kind': 'declarative', 'schema_version': 1, 'components': [{'type': 'poll', 'route': 'status'}]})\n",
+        permissions=["widget"],
+    )
+    err = extension_loader.load_extension(loaded, lambda: {})
+    assert err is None, err
+    snap = extension_loader.snapshot()
+    assert snap["ui_tabs"][0]["render"]["components"][0]["type"] == "poll"
 
 
 def test_load_extension_permission_gate_tool(tmp_path):
@@ -406,7 +564,12 @@ def test_load_extension_refuses_disabled(tmp_path):
     assert "disabled" in err
 
 
-def test_reconcile_extension_unloads_when_runtime_mode_light(tmp_path, monkeypatch):
+def test_reconcile_extension_stays_loaded_in_light_mode(tmp_path, monkeypatch):
+    """v5.1.2 Frame A: ``light`` no longer unloads extensions. The
+    ``runtime_mode_light`` reason is gone from
+    ``_extension_runtime_state``. Extensions follow the same
+    enabled / review / content-hash gates regardless of mode.
+    """
     plugin = (
         "def _echo(ctx):\n"
         "    return 'ok'\n"
@@ -430,9 +593,11 @@ def test_reconcile_extension_unloads_when_runtime_mode_light(tmp_path, monkeypat
         lambda: {},
         repo_path=repo_root,
     )
-    assert state["reason"] == "runtime_mode_light"
-    assert state["action"] == "extension_unloaded"
-    assert "lightstop" not in extension_loader.snapshot()["extensions"]
+    # The ``runtime_mode_light`` reason was removed in v5.1.2; the
+    # extension stays live.
+    assert state["reason"] != "runtime_mode_light"
+    assert state["action"] != "extension_unloaded"
+    assert "lightstop" in extension_loader.snapshot()["extensions"]
 
 
 def test_reconcile_extension_keeps_live_extension_loaded(tmp_path, monkeypatch):
@@ -507,7 +672,7 @@ def test_reconcile_extension_reloads_when_live_code_changes(tmp_path):
     loaded = find_skill(drive_root, "reloadme", repo_path=str(skill_dir.parent))
     err = extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root)
     assert err is None, err
-    tool = extension_loader.get_tool("ext.reloadme.echo")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("reloadme", "echo"))
     assert tool is not None
     assert tool["handler"](None) == "v1"
 
@@ -537,7 +702,7 @@ def test_reconcile_extension_reloads_when_live_code_changes(tmp_path):
     )
     assert state["action"] == "extension_loaded"
     assert state["live_loaded"] is True
-    tool = extension_loader.get_tool("ext.reloadme.echo")
+    tool = extension_loader.get_tool(extension_loader.extension_surface_name("reloadme", "echo"))
     assert tool is not None
     assert tool["handler"](None) == "v2"
 
@@ -586,14 +751,16 @@ def test_runtime_state_for_skill_name_reports_missing_skill(tmp_path):
     assert state["reason"] == "missing"
 
 
-def test_get_settings_respects_allowlist_and_denylist(tmp_path):
-    """get_settings only returns keys in BOTH the manifest allowlist AND
-    NOT in FORBIDDEN_EXTENSION_SETTINGS."""
+def test_get_settings_blocks_core_keys_without_grant(tmp_path):
+    """An extension that lists a core key in env_from_settings without
+    an owner grant fails to load and ``PluginAPIImpl.get_settings``
+    silently drops the key — the dual-track grant model deliberately
+    keeps the failure mode the same as the script path."""
     plugin = (
         "def register(api):\n"
         "    api.register_tool('n', lambda ctx: 'ok', description='n', schema={})\n"
     )
-    loaded, _, _ = _prepare_extension(
+    loaded, _, drive_root = _prepare_extension(
         tmp_path,
         "envtest",
         plugin,
@@ -606,8 +773,10 @@ def test_get_settings_respects_allowlist_and_denylist(tmp_path):
         "MY_OK": "visible",
         "RANDOM_OTHER": "not-allowed",
     }
-    err = extension_loader.load_extension(loaded, lambda: settings_snapshot)
-    assert err is None, err
+    err = extension_loader.load_extension(loaded, lambda: settings_snapshot, drive_root=drive_root)
+    assert err is not None
+    assert "missing owner grants" in err
+    assert "OPENROUTER_API_KEY" in err
 
     impl = extension_loader.PluginAPIImpl(
         skill_name="envtest",
@@ -615,15 +784,106 @@ def test_get_settings_respects_allowlist_and_denylist(tmp_path):
         env_allowlist=["OPENROUTER_API_KEY", "TIMEZONE", "MY_OK"],
         state_dir=tmp_path,
         settings_reader=lambda: settings_snapshot,
+        granted_keys=[],
     )
     got = impl.get_settings(["OPENROUTER_API_KEY", "TIMEZONE", "MY_OK", "RANDOM_OTHER"])
-    # Forbidden key dropped:
     assert "OPENROUTER_API_KEY" not in got
-    # Allowed non-secret key surfaced:
     assert got["TIMEZONE"] == "UTC"
     assert got["MY_OK"] == "visible"
-    # Not in allowlist → not returned:
     assert "RANDOM_OTHER" not in got
+
+
+def test_load_extension_rejects_grant_with_stale_content_hash(tmp_path):
+    """v5.2.2 dual-track grants: the loader binds the persisted grant
+    to the current content hash. A grants.json written for a prior
+    revision must NOT authorise the freshly-edited plugin (defense in
+    depth — even if ``grant_status_for_skill`` is bypassed)."""
+    from ouroboros.skill_loader import save_skill_grants
+
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('n', lambda ctx: 'ok', description='n', schema={})\n"
+    )
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "stale_grant",
+        plugin,
+        permissions=["tool", "read_settings"],
+        env_from_settings=["OPENROUTER_API_KEY"],
+    )
+    # Persist a grant with the WRONG content hash — simulates a manifest
+    # / plugin edit that the operator has not re-authorised.
+    save_skill_grants(
+        drive_root,
+        "stale_grant",
+        ["OPENROUTER_API_KEY"],
+        content_hash="some-other-hash",
+        requested_keys=["OPENROUTER_API_KEY"],
+    )
+    err = extension_loader.load_extension(
+        loaded,
+        lambda: {"OPENROUTER_API_KEY": "sk-secret"},
+        drive_root=drive_root,
+    )
+    assert err is not None
+    assert "missing owner grants" in err
+
+
+def test_get_settings_returns_core_key_with_grant(tmp_path):
+    """An owner-granted core key is forwarded to the in-process plugin
+    via ``PluginAPIImpl.get_settings``. The grant must be bound to the
+    current content hash + manifest-requested set; ``load_extension``
+    enforces both before constructing the API impl."""
+    from ouroboros.skill_loader import save_skill_grants
+
+    plugin = (
+        "def register(api):\n"
+        "    api.register_tool('n', lambda ctx: 'ok', description='n', schema={})\n"
+    )
+    loaded, _, drive_root = _prepare_extension(
+        tmp_path,
+        "granted_ext",
+        plugin,
+        permissions=["tool", "read_settings"],
+        env_from_settings=["OPENROUTER_API_KEY", "TIMEZONE"],
+    )
+    save_skill_grants(
+        drive_root,
+        "granted_ext",
+        ["OPENROUTER_API_KEY"],
+        content_hash=loaded.content_hash,
+        requested_keys=["OPENROUTER_API_KEY"],
+    )
+    settings_snapshot = {
+        "OPENROUTER_API_KEY": "sk-allowed",
+        "TIMEZONE": "UTC",
+    }
+    err = extension_loader.load_extension(loaded, lambda: settings_snapshot, drive_root=drive_root)
+    assert err is None, err
+
+    impl = extension_loader.PluginAPIImpl(
+        skill_name="granted_ext",
+        permissions=["read_settings"],
+        env_allowlist=["OPENROUTER_API_KEY", "TIMEZONE"],
+        state_dir=tmp_path,
+        settings_reader=lambda: settings_snapshot,
+        granted_keys=["OPENROUTER_API_KEY"],
+    )
+    got = impl.get_settings(["OPENROUTER_API_KEY", "TIMEZONE"])
+    assert got.get("OPENROUTER_API_KEY") == "sk-allowed"
+    assert got.get("TIMEZONE") == "UTC"
+
+    # Grant on the WRONG content hash must not authorise — the loader
+    # builds an empty granted_keys list and drops the value.
+    impl_no_grant = extension_loader.PluginAPIImpl(
+        skill_name="granted_ext",
+        permissions=["read_settings"],
+        env_allowlist=["OPENROUTER_API_KEY", "TIMEZONE"],
+        state_dir=tmp_path,
+        settings_reader=lambda: settings_snapshot,
+        granted_keys=[],
+    )
+    assert "OPENROUTER_API_KEY" not in impl_no_grant.get_settings(["OPENROUTER_API_KEY"])
 
 
 def test_unload_removes_all_registrations(tmp_path):
@@ -777,8 +1037,8 @@ def test_unload_clears_child_module_cache(tmp_path):
     assert err is None, err
     # Both the package module and its helper child module must live in
     # sys.modules after import, and BOTH must be purged on unload.
-    parent_key = "ouroboros._extensions.tree_ext"
-    child_key = "ouroboros._extensions.tree_ext.helper"
+    parent_key = extension_loader._module_key("tree_ext")
+    child_key = f"{parent_key}.helper"
     assert parent_key in _sys.modules
     assert child_key in _sys.modules
     extension_loader.unload_extension("tree_ext")

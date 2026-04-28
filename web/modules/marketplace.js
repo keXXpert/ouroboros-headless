@@ -9,14 +9,6 @@
  * is automatic.
  */
 
-const SORT_OPTIONS = [
-    { value: 'downloads', label: 'Most downloaded' },
-    { value: 'stars', label: 'Most starred' },
-    { value: 'recent', label: 'Recently updated' },
-    { value: 'name', label: 'Name' },
-];
-
-
 function escapeHtml(value) {
     return String(value ?? '')
         .replace(/&/g, '&amp;')
@@ -120,21 +112,19 @@ function formatNumber(value) {
 }
 
 
+const MARKETPLACE_SEARCH_LIMIT = 16;
+
+
 function paneTemplate() {
     return `
         <div class="marketplace-shell">
             <div class="marketplace-controls">
                 <input type="search" id="mp-query" class="marketplace-search"
-                       placeholder="Search ClawHub skills…" autocomplete="off">
-                <select id="mp-sort" class="marketplace-select">
-                    ${SORT_OPTIONS.map((opt) => `<option value="${opt.value}">${opt.label}</option>`).join('')}
-                </select>
+                       placeholder="Search ClawHub skills by name or summary…" autocomplete="off">
                 <label class="marketplace-checkbox">
                     <input type="checkbox" id="mp-only-official"> Official only
                 </label>
-                <input type="text" id="mp-os-filter" class="marketplace-input"
-                       placeholder="OS filter (darwin, linux, ...)">
-                <button class="btn btn-default" data-mp-refresh>Refresh</button>
+                <button class="btn btn-primary" data-mp-search>Search</button>
             </div>
             <div id="mp-status" class="muted marketplace-status"></div>
             <div id="mp-results" class="marketplace-results"></div>
@@ -224,9 +214,24 @@ function summaryCard(summary, installedMap, isPlugin) {
 }
 
 
-function renderResults(host, summaries, installedMap) {
+function renderResults(host, summaries, installedMap, registryCount, diagnostics) {
     if (!summaries.length) {
-        host.innerHTML = '<div class="muted">No skills match the current filters.</div>';
+        if (registryCount > 0) {
+            host.innerHTML = '<div class="muted">Registry returned skills, but none are installable in this view.</div>';
+        } else {
+            const path = diagnostics?.registryPath || 'skills';
+            const attempts = Array.isArray(diagnostics?.attempts) && diagnostics.attempts.length
+                ? `<details class="marketplace-debug"><summary>Registry diagnostics</summary><pre>${escapeHtml(JSON.stringify(diagnostics.attempts, null, 2))}</pre></details>`
+                : '';
+            host.innerHTML = `
+                <div class="muted">
+                    ClawHub returned zero installable skills from <code>${escapeHtml(path)}</code>.
+                    Browse uses <code>packages?family=skill</code>; text search uses
+                    <code>search?q=...</code>.
+                </div>
+                ${attempts}
+            `;
+        }
         return;
     }
     host.innerHTML = summaries
@@ -235,17 +240,18 @@ function renderResults(host, summaries, installedMap) {
 }
 
 
-function renderPagination(host, { offset, limit, count }) {
-    if (count < limit && offset === 0) {
+function renderPagination(host, { query, limit, count, cursor, hasPrevious, nextCursor }) {
+    const searchMode = Boolean(String(query || '').trim());
+    if (searchMode || (!nextCursor && !hasPrevious)) {
         host.hidden = true;
         host.innerHTML = '';
         return;
     }
     host.hidden = false;
     host.innerHTML = `
-        <button class="btn btn-default" data-mp-prev ${offset <= 0 ? 'disabled' : ''}>Prev</button>
-        <span class="muted">offset ${offset} · showing ${count}</span>
-        <button class="btn btn-default" data-mp-next ${count < limit ? 'disabled' : ''}>Next</button>
+        <button class="btn btn-default" data-mp-prev ${hasPrevious ? '' : 'disabled'}>Prev</button>
+        <span class="muted">${cursor ? 'cursor page' : 'first page'} · ${count} shown</span>
+        <button class="btn btn-default" data-mp-next ${nextCursor ? '' : 'disabled'}>Next</button>
     `;
 }
 
@@ -282,8 +288,12 @@ async function fetchJson(url, init) {
 
 
 async function loadInstalled() {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
     try {
-        const data = await fetchJson('/api/marketplace/clawhub/installed');
+        const data = await fetchJson('/api/marketplace/clawhub/installed', {
+            signal: controller.signal,
+        });
         const map = new Map();
         for (const skill of data.skills || []) {
             const provSlug = skill.provenance?.slug;
@@ -291,18 +301,23 @@ async function loadInstalled() {
         }
         return map;
     } catch (err) {
-        console.warn('marketplace: installed lookup failed', err);
+        if (err?.name !== 'AbortError') {
+            console.warn('marketplace: installed lookup failed', err);
+        }
         return new Map();
+    } finally {
+        clearTimeout(timer);
     }
 }
 
 
 async function runSearch(state) {
     const params = new URLSearchParams();
-    if (state.query) params.set('q', state.query);
-    if (state.sort) params.set('sort', state.sort);
-    params.set('limit', String(state.limit));
-    params.set('offset', String(state.offset));
+    const query = String(state.query || '').trim();
+    if (query) params.set('q', query);
+    params.set('limit', String(query ? MARKETPLACE_SEARCH_LIMIT : state.limit));
+    if (!query && state.cursor) params.set('cursor', state.cursor);
+    if (state.onlyOfficial) params.set('official', '1');
     return fetchJson(`/api/marketplace/clawhub/search?${params.toString()}`);
 }
 
@@ -509,66 +524,70 @@ export function initMarketplace(pane) {
 
     const state = {
         query: '',
-        sort: 'downloads',
         limit: 25,
-        offset: 0,
         onlyOfficial: false,
-        osFilter: '',
         results: [],
         installedMap: new Map(),
+        cursor: '',
+        cursorHistory: [],
+        nextCursor: '',
+        registryPath: 'packages',
+        registryAttempts: [],
     };
 
     const queryInput = pane.querySelector('#mp-query');
-    const sortSelect = pane.querySelector('#mp-sort');
     const onlyOfficial = pane.querySelector('#mp-only-official');
-    const osFilter = pane.querySelector('#mp-os-filter');
-    const refreshBtn = pane.querySelector('[data-mp-refresh]');
+    const searchBtn = pane.querySelector('[data-mp-search]');
     const resultsHost = pane.querySelector('#mp-results');
     const paginationHost = pane.querySelector('#mp-pagination');
     const modalHost = pane.querySelector('#mp-modal-host');
 
     let debounceTimer = null;
 
+    function syncControlsForMode() {
+        const searchMode = Boolean(String(state.query || '').trim());
+        onlyOfficial.title = searchMode
+            ? 'Filters enriched search results to skills marked official.'
+            : '';
+    }
+
     async function refresh() {
+        syncControlsForMode();
         showStatus(pane, 'Loading…', 'muted');
         try {
-            state.installedMap = await loadInstalled();
+            const query = String(state.query || '').trim();
+            state.installedMap = new Map();
             const data = await runSearch(state);
             state.results = data.results || [];
-            const filtered = state.results.filter((s) => {
-                if (state.onlyOfficial && !s.badges?.official) return false;
-                if (state.osFilter) {
-                    const wanted = state.osFilter.toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
-                    const skillOs = (s.os || []).map((x) => String(x).toLowerCase());
-                    if (skillOs.length && wanted.length) {
-                        const overlap = wanted.some((w) => skillOs.includes(w));
-                        if (!overlap) return false;
-                    }
-                }
-                return true;
+            state.nextCursor = data.next_cursor || '';
+            state.registryPath = data.registry_path || 'packages';
+            state.registryAttempts = data.registry_attempts || [];
+            renderResults(resultsHost, state.results, state.installedMap, state.results.length, {
+                registryPath: state.registryPath,
+                attempts: state.registryAttempts,
             });
-            renderResults(resultsHost, filtered, state.installedMap);
             renderPagination(paginationHost, {
-                offset: state.offset,
+                query,
                 limit: state.limit,
                 count: state.results.length,
+                cursor: state.cursor,
+                hasPrevious: state.cursorHistory.length > 0,
+                nextCursor: state.nextCursor,
             });
-            showStatus(pane,
-                `${filtered.length} skill${filtered.length === 1 ? '' : 's'} (showing ${state.results.length} from registry)`,
-                'muted',
-            );
+            const mode = query ? 'search' : 'browse';
+            const official = state.onlyOfficial ? ' · official only' : '';
+            showStatus(pane, `${state.results.length} skill${state.results.length === 1 ? '' : 's'} · ${mode}${official} · ${state.registryPath}`, 'muted');
+            loadInstalled().then((installedMap) => {
+                state.installedMap = installedMap;
+                renderResults(resultsHost, state.results, state.installedMap, state.results.length, {
+                    registryPath: state.registryPath,
+                    attempts: state.registryAttempts,
+                });
+            }).catch(() => {});
         } catch (err) {
             const message = err?.body?.error || err?.message || String(err);
             showStatus(pane, `Error: ${message}`, 'danger');
-            if (err?.status === 403) {
-                resultsHost.innerHTML = `
-                    <div class="muted">Marketplace is disabled. Enable it in
-                    Settings &rarr; Behavior &rarr; ClawHub Marketplace
-                    (sets <code>OUROBOROS_CLAWHUB_ENABLED=true</code>).</div>
-                `;
-            } else {
-                resultsHost.innerHTML = `<div class="skills-load-error">${escapeHtml(message)}</div>`;
-            }
+            resultsHost.innerHTML = `<div class="skills-load-error">${escapeHtml(message)}</div>`;
             paginationHost.hidden = true;
         }
     }
@@ -580,32 +599,29 @@ export function initMarketplace(pane) {
 
     queryInput.addEventListener('input', (event) => {
         state.query = event.target.value || '';
-        state.offset = 0;
+        state.cursor = '';
+        state.cursorHistory = [];
         scheduleRefresh(false);
-    });
-    sortSelect.addEventListener('change', () => {
-        state.sort = sortSelect.value;
-        state.offset = 0;
-        scheduleRefresh(true);
     });
     onlyOfficial.addEventListener('change', () => {
         state.onlyOfficial = onlyOfficial.checked;
+        state.cursor = '';
+        state.cursorHistory = [];
         scheduleRefresh(true);
     });
-    osFilter.addEventListener('input', (event) => {
-        state.osFilter = event.target.value || '';
-        scheduleRefresh(false);
-    });
-    refreshBtn.addEventListener('click', () => scheduleRefresh(true));
+    searchBtn.addEventListener('click', () => scheduleRefresh(true));
 
     paginationHost.addEventListener('click', (event) => {
         const prev = event.target.closest('[data-mp-prev]');
         const next = event.target.closest('[data-mp-next]');
         if (prev) {
-            state.offset = Math.max(0, state.offset - state.limit);
+            state.cursor = state.cursorHistory.pop() || '';
             scheduleRefresh(true);
         } else if (next) {
-            state.offset = state.offset + state.limit;
+            if (state.nextCursor) {
+                state.cursorHistory.push(state.cursor || '');
+                state.cursor = state.nextCursor;
+            }
             scheduleRefresh(true);
         }
     });

@@ -37,6 +37,7 @@ from ouroboros.config import (
     acquire_pid_lock,
     apply_settings_to_env as _apply_settings_to_env,
     load_settings,
+    normalize_runtime_mode,
     read_version,
     release_pid_lock,
     save_settings,
@@ -248,7 +249,9 @@ def _bootstrap_context() -> BootstrapContext:
         embedded_python=EMBEDDED_PYTHON,
         app_version=APP_VERSION,
         hidden_run=_hidden_run,
-        save_settings=save_settings,
+        # Launcher-driven save: owner-process action, allow_elevation=True
+        # so first-launch env migration can set any runtime_mode.
+        save_settings=lambda settings: save_settings(settings, allow_elevation=True),
         log=log,
     )
 
@@ -527,7 +530,121 @@ def _load_settings() -> dict:
 
 
 def _save_settings(settings: dict) -> None:
-    save_settings(settings)
+    # Launcher is the owner-process boundary: first-run wizard, env-var
+    # migration, and provider-default seeds all flow through here.
+    # ``allow_elevation=True`` lets the owner pick any ``OUROBOROS_RUNTIME_MODE``
+    # at first launch; the agent-callable path (``api_settings_post``,
+    # ``_set_tool_timeout``) keeps the default ``False``.
+    save_settings(settings, allow_elevation=True)
+
+
+def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
+    new_mode = normalize_runtime_mode(mode)
+    settings = _load_settings()
+    old_mode = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
+    if new_mode == old_mode:
+        return {"ok": True, "runtime_mode": new_mode, "restart_required": False}
+    message = (
+        f"Change Ouroboros runtime mode from {old_mode} to {new_mode}?\n\n"
+        "This is an owner-only operation. The new mode is saved by the "
+        "desktop launcher and takes effect after restart."
+    )
+    if not confirm_fn("Confirm Runtime Mode Change", message):
+        return {"ok": False, "error": "Runtime mode change cancelled."}
+    settings["OUROBOROS_RUNTIME_MODE"] = new_mode
+    _save_settings(settings)
+    return {"ok": True, "runtime_mode": new_mode, "restart_required": True}
+
+
+def _request_skill_key_grant(skill: str, keys: list, confirm_fn) -> dict:
+    from ouroboros.skill_loader import (
+        find_skill,
+        requested_core_setting_keys,
+        save_skill_grants,
+    )
+
+    skill_name = str(skill or "").strip()
+    requested = [str(k or "").strip().upper() for k in (keys or []) if str(k or "").strip()]
+    loaded = find_skill(
+        DATA_DIR,
+        skill_name,
+        repo_path=str(_load_settings().get("OUROBOROS_SKILLS_REPO_PATH") or ""),
+    )
+    if loaded is None:
+        return {"ok": False, "error": f"Skill {skill_name!r} not found"}
+    if not (loaded.manifest.is_script() or loaded.manifest.is_extension()):
+        return {"ok": False, "error": "Core-key grants are supported for script and extension skills."}
+    if loaded.review.status != "pass" or loaded.review.is_stale_for(loaded.content_hash):
+        return {"ok": False, "error": "Key grants require a fresh PASS review."}
+    allowed = requested_core_setting_keys(list(loaded.manifest.env_from_settings or []))
+    if not requested or any(key not in allowed for key in requested):
+        return {"ok": False, "error": f"Grant keys must be requested by the current manifest: {allowed}"}
+    message = (
+        f"Grant skill {loaded.name!r} access to these settings keys?\n\n"
+        + "\n".join(requested)
+        + "\n\nOnly grant keys to reviewed skills you trust."
+    )
+    if not confirm_fn("Confirm Skill Key Grant", message):
+        return {"ok": False, "error": "Skill key grant cancelled."}
+    save_skill_grants(
+        DATA_DIR,
+        loaded.name,
+        requested,
+        content_hash=loaded.content_hash,
+        requested_keys=allowed,
+    )
+    # v5.2.2 dual-track grants: extensions need a runtime reconcile so
+    # the just-granted core key reaches ``PluginAPIImpl.get_settings``
+    # without forcing the operator to toggle disable/enable. Scripts
+    # pick up the grant on the next ``skill_exec`` call automatically
+    # via ``_scrub_env`` so they do not need this reload.
+    #
+    # Cross-process boundary: launcher.py and server.py are independent
+    # OS processes. The launcher cannot mutate the server's in-process
+    # ``extension_loader._extensions`` / ``_load_failures`` dicts; an
+    # in-launcher ``reconcile_extension`` call would only mutate dead
+    # state and additionally execute the plugin's ``register(api)``
+    # inside the immutable launcher process, which violates the
+    # launcher contract documented at the top of this file. We POST to
+    # the agent server's loopback ``/api/skills/<skill>/reconcile``
+    # endpoint instead, which clears the server's cached load failure
+    # and re-runs ``load_extension`` in the right address space.
+    extension_action = None
+    extension_reason = None
+    extension_load_error = None
+    if loaded.manifest.is_extension():
+        import json as _json
+        import urllib.parse as _urlparse
+        import urllib.request as _urlreq
+
+        try:
+            actual_port = _read_port_file() or AGENT_SERVER_PORT
+            req = _urlreq.Request(
+                f"http://127.0.0.1:{actual_port}/api/skills/"
+                f"{_urlparse.quote(loaded.name)}/reconcile",
+                method="POST",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+            )
+            with _urlreq.urlopen(req, timeout=10) as resp:
+                payload = _json.loads(resp.read().decode("utf-8") or "{}")
+            extension_action = payload.get("extension_action")
+            extension_reason = payload.get("extension_reason")
+            extension_load_error = payload.get("load_error")
+        except Exception as exc:
+            log.warning(
+                "Skill grant saved but server-side reconcile failed for %s: %s",
+                loaded.name, exc, exc_info=True,
+            )
+            extension_reason = "reconcile_call_failed"
+    return {
+        "ok": True,
+        "skill": loaded.name,
+        "granted_keys": requested,
+        "extension_action": extension_action,
+        "extension_reason": extension_reason,
+        "load_error": extension_load_error,
+    }
 
 
 def _claude_code_status_payload(settings: dict | None = None) -> dict:
@@ -786,10 +903,37 @@ def main():
         webview.start()
         return
 
+    class MainApi:
+        def request_runtime_mode_change(self, mode: str) -> dict:
+            try:
+                return _request_runtime_mode_change(
+                    mode,
+                    lambda title, message: bool(
+                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
+                    ),
+                )
+            except Exception as exc:
+                log.warning("Runtime mode native confirmation failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": f"Native confirmation failed: {exc}"}
+
+        def request_skill_key_grant(self, skill: str, keys: list) -> dict:
+            try:
+                return _request_skill_key_grant(
+                    skill,
+                    keys,
+                    lambda title, message: bool(
+                        _webview_window and _webview_window.create_confirmation_dialog(title, message)
+                    ),
+                )
+            except Exception as exc:
+                log.warning("Skill grant native confirmation failed: %s", exc, exc_info=True)
+                return {"ok": False, "error": f"Native confirmation failed: {exc}"}
+
     url = f"http://127.0.0.1:{actual_port}"
     window = webview.create_window(
         f"Ouroboros v{APP_VERSION}",
         url=url,
+        js_api=MainApi(),
         width=1100,
         height=750,
         min_size=(800, 500),

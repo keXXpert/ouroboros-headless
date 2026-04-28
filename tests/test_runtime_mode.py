@@ -261,8 +261,12 @@ def test_settings_js_reads_and_writes_phase2_keys():
     src = (REPO / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
     assert "OUROBOROS_RUNTIME_MODE" in src
     assert "OUROBOROS_SKILLS_REPO_PATH" in src
-    # The collect_body path must send both keys to /api/settings.
-    assert "byId('s-runtime-mode').value" in src
+    # v5.1.2 Frame A: the load path still hydrates the segmented control
+    # so the UI displays the current owner-set runtime_mode. The save
+    # path no longer sends ``OUROBOROS_RUNTIME_MODE`` (mode is owner-only;
+    # /api/settings drops it from the body merge), only the skills-repo
+    # path round-trips through the form.
+    assert "byId('s-runtime-mode').value = s.OUROBOROS_RUNTIME_MODE" in src
     assert "byId('s-skills-repo-path').value.trim()" in src
 
 
@@ -282,10 +286,9 @@ def test_phase4_ui_copy_matches_shipped_runtime():
     assert "land in Phase 3" not in settings_ui
     # v4.50: skills moved to data/skills/{native,clawhub,external}/ —
     # the legacy ``repo/skills/`` reference no longer appears in the
-    # settings copy. The onboarding wizard still mentions
-    # "Settings → Behavior" as a guidance breadcrumb.
+    # settings copy.
     assert "data/skills/" in settings_ui
-    assert "Settings → Behavior" in onboarding_js
+    assert "Pick both review enforcement and the initial runtime mode" in onboarding_js
     assert "normal triad + scope review" in onboarding_js
     assert "Phase 6+:" not in onboarding_js
 
@@ -399,15 +402,16 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
             json={"OUROBOROS_RUNTIME_MODE": "turbo"},
         )
         assert resp.status_code == 200, resp.text
-        # What actually got persisted must be the clamped value, not "turbo".
-        assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced", (
-            "Unknown runtime_mode was accepted verbatim — normalize_runtime_mode "
-            "is not running on the save path."
-        )
+        # v5.1.2: /api/settings drops OUROBOROS_RUNTIME_MODE entirely — even
+        # invalid inputs do not reach the body merge. The persisted value
+        # must equal the SETTINGS_DEFAULTS baseline ("advanced") via the
+        # belt-and-braces revert in api_settings_post, not via clamping.
+        assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
 
 
-def test_api_settings_post_accepts_valid_runtime_mode():
-    """POSTing a valid runtime mode saves it verbatim."""
+def test_api_settings_post_silently_drops_runtime_mode_changes():
+    """v5.1.2 elevation ratchet: even a VALID runtime_mode in the body
+    is silently dropped — the API never accepts mode changes."""
     import server as srv
     from starlette.testclient import TestClient
     from unittest.mock import patch
@@ -417,10 +421,16 @@ def test_api_settings_post_accepts_valid_runtime_mode():
     def fake_load_settings():
         from ouroboros.config import SETTINGS_DEFAULTS
         out = dict(SETTINGS_DEFAULTS)
+        out["OUROBOROS_RUNTIME_MODE"] = "light"  # baseline on disk
         out.update(saved)
         return out
 
-    def fake_save_settings(payload):
+    def fake_save_settings(payload, *, allow_elevation: bool = False):
+        # Mirror real save_settings semantics so the test reflects the
+        # actual chokepoint behaviour (no need to verify the elevation
+        # PermissionError here — that is covered by
+        # tests/test_runtime_mode_elevation.py; here we only assert the
+        # API-level drop).
         saved.clear()
         saved.update(payload)
 
@@ -436,9 +446,9 @@ def test_api_settings_post_accepts_valid_runtime_mode():
             json={"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SKILLS_REPO_PATH": "  /tmp/sk  "},
         )
         assert resp.status_code == 200, resp.text
-        assert saved["OUROBOROS_RUNTIME_MODE"] == "pro"
-        # Whitespace around the skills repo path must be stripped so the
-        # "configured vs empty" boolean in /api/state stays deterministic.
+        # Mode change is dropped: persisted value comes from on-disk old.
+        assert saved["OUROBOROS_RUNTIME_MODE"] == "light"
+        # Other (non-owner-only) keys still flow through.
         assert saved["OUROBOROS_SKILLS_REPO_PATH"] == "/tmp/sk"
 
 

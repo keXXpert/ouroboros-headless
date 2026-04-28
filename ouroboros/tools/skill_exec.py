@@ -21,9 +21,14 @@ Design rules (per the Phase 3 plan):
   stderr so a misbehaving skill cannot flood the runtime logs.
 - The runtime allowlist is ``python``/``python3``/``bash``/``node``;
   anything else is rejected up-front.
-- Runtime-mode gate: ``light`` blocks execution entirely (the whole
-  point of light mode is "no agent-initiated side effects beyond reading");
-  ``advanced`` and ``pro`` both allow reviewed skills to execute.
+- Runtime-mode gate (v5.1.2 Frame A): ``light``/``advanced``/``pro`` ALL
+  allow reviewed + enabled skills to execute. The ``runtime_mode`` axis
+  controls only repo self-modification + the ``OUROBOROS_RUNTIME_MODE``
+  elevation ratchet — owner-approved skills already pass through their
+  own independent stack (tri-model review PASS + ``enabled.json`` toggle
+  + content-hash freshness + sandboxed subprocess + ``FORBIDDEN_SKILL_SETTINGS``
+  denylist), so a runtime_mode gate on top would only deny owner-approved
+  capabilities without adding security.
 """
 
 from __future__ import annotations
@@ -38,7 +43,7 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.config import get_runtime_mode, get_skills_repo_path, load_settings
+from ouroboros.config import get_skills_repo_path, load_settings
 from ouroboros.skill_loader import (
     SkillPayloadUnreadable,
     VALID_REVIEW_STATUSES,
@@ -114,15 +119,11 @@ _ALWAYS_FORWARDED_ENV = frozenset(
     }
 )
 
-# Hard denylist of settings keys we refuse to forward via
-# ``env_from_settings`` regardless of what the manifest requests. The
-# first layer of defence is the tri-model skill review (``env_allowlist``
-# checklist item), but that depends on reviewer perfection. Keeping a
-# runtime denylist here means a missed review cannot leak production
-# credentials / tokens / the network-gate password to an executing
-# skill. Skills that genuinely need an API key should talk to the
-# ``main`` Ouroboros process rather than receive it as a subprocess
-# envvar.
+# Core settings keys that require explicit, content-bound owner grants
+# before they can be forwarded through ``env_from_settings``. The first
+# layer of defence is the tri-model skill review, but the runtime still
+# refuses to pass these values unless the reviewed script skill carries a
+# matching grant.
 _FORBIDDEN_ENV_FORWARD_KEYS = FORBIDDEN_SKILL_SETTINGS
 
 
@@ -159,6 +160,7 @@ def _scrub_env(
     manifest_env_keys: List[str],
     skill_state_dir_path: pathlib.Path,
     skill_name: str,
+    granted_keys: List[str] | None = None,
 ) -> Dict[str, str]:
     """Build a minimal env for the subprocess.
 
@@ -183,18 +185,20 @@ def _scrub_env(
         # tries to sneak in ``openrouter_api_key`` (lowercase) is still
         # refused.
         forbidden_upper = {k.upper() for k in _FORBIDDEN_ENV_FORWARD_KEYS}
+        granted_upper = {str(k).strip().upper() for k in (granted_keys or []) if str(k).strip()}
         allow = {str(k).strip() for k in manifest_env_keys if str(k).strip()}
         for key in allow:
-            if key.upper() in forbidden_upper:
+            canonical = key.upper()
+            if canonical in forbidden_upper and canonical not in granted_upper:
                 log.warning(
-                    "Skill %s asked env_from_settings for %s; refusing by runtime denylist.",
+                    "Skill %s asked env_from_settings for %s; refusing without explicit grant.",
                     skill_name, key,
                 )
                 continue
-            val = settings.get(key)
+            val = settings.get(canonical) if canonical in forbidden_upper else settings.get(key)
             if val is None or val == "":
                 continue
-            env[key] = str(val)
+            env[canonical if canonical in forbidden_upper else key] = str(val)
     env["OUROBOROS_SKILL_NAME"] = skill_name
     env["OUROBOROS_SKILL_STATE_DIR"] = str(skill_state_dir_path)
     return env
@@ -476,13 +480,16 @@ def _handle_skill_exec(
     if err:
         return err
 
-    runtime_mode = get_runtime_mode()
-    if runtime_mode == "light":
-        return (
-            "⚠️ SKILL_EXEC_BLOCKED: runtime_mode=light disables skill "
-            "execution. Switch to 'advanced' or 'pro' in Settings → "
-            "Behavior → Runtime Mode to allow reviewed skills to run."
-        )
+    # v5.1.2 light reframed: ``light`` blocks repo self-modification but
+    # ALLOWS reviewed + enabled skills to execute. Skills already have
+    # their own independent safety stack (tri-model review PASS verdict
+    # + ``enabled.json`` toggle + content-hash freshness + sandboxed
+    # subprocess with cwd / scrubbed env / runtime allowlist / 300s
+    # ceiling / byte caps + ``FORBIDDEN_SKILL_SETTINGS`` denylist), so
+    # gating execution by ``runtime_mode`` would only deny owner-
+    # approved capabilities. Repo-mutation tools and the elevation
+    # ratchet (``save_settings`` / ``_data_write`` to settings.json)
+    # remain blocked; that is what ``light`` is for.
 
     skill_name = str(skill or "").strip()
     script_rel = str(script or "").strip()
@@ -513,8 +520,9 @@ def _handle_skill_exec(
             "been called; the loader registered whatever ``plugin.py`` "
             "declared (inspect via the snapshot produced by "
             "``ouroboros.extension_loader.snapshot()``). Use its "
-            "``ext.<skill>.*`` tools, ``/api/extensions/<skill>/...`` "
-            "routes, or ``ext.<skill>.*`` WebSocket handlers instead."
+            "provider-safe ``ext_<len>_<token>_*`` tools, "
+            "``/api/extensions/<skill>/...`` routes, or provider-safe "
+            "extension WebSocket handlers instead."
         )
     # Phase 3 ``skill_exec`` only executes ``type: script`` skills.
     # ``instruction`` skills are catalogued + reviewable but have no
@@ -662,13 +670,22 @@ def _handle_skill_exec(
         cmd.append(str(arg))
 
     timeout = _bound_timeout(loaded.manifest.timeout_sec)
-    from ouroboros.skill_loader import skill_state_dir
+    from ouroboros.skill_loader import grant_status_for_skill, skill_state_dir
 
     state_dir = skill_state_dir(drive_root, loaded.name)
+    grants = grant_status_for_skill(drive_root, loaded)
+    missing_core = list(grants.get("missing_keys") or [])
+    if missing_core:
+        return (
+            "⚠️ SKILL_EXEC_GRANT_REQUIRED: skill "
+            f"{loaded.name!r} requests core settings keys {missing_core}. "
+            "Grant them from the Skills UI after a fresh PASS review before execution."
+        )
     env = _scrub_env(
         manifest_env_keys=list(loaded.manifest.env_from_settings or []),
         skill_state_dir_path=state_dir,
         skill_name=loaded.name,
+        granted_keys=list(grants.get("granted_keys") or []),
     )
 
     try:
@@ -911,8 +928,10 @@ _EXEC_SCHEMA = {
         "Runtime allowlist: python/python3/bash/node. The subprocess "
         "runs with cwd=skill_dir, a scrubbed env (env_from_settings "
         "keys only), panic-kill tracking, and a timeout from the "
-        "manifest (capped at 300s). Blocked entirely when "
-        "OUROBOROS_RUNTIME_MODE=light."
+        "manifest (capped at 300s). v5.1.2 Frame A: OUROBOROS_RUNTIME_MODE "
+        "no longer gates execution — light, advanced, and pro all let "
+        "reviewed + enabled skills run. Light still blocks repo "
+        "self-modification and the runtime_mode elevation ratchet."
     ),
     "parameters": {
         "type": "object",

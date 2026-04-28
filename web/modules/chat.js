@@ -75,7 +75,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
                     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
                 </button>
                 <input type="file" id="chat-file-input" class="chat-file-input-hidden" accept="*/*">
-                <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1"></textarea>
+                <textarea id="chat-input" placeholder="Message Ouroboros..." rows="1" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
                 <div class="chat-send-group">
                     <button class="chat-send-inline" id="chat-send" title="Send message">Send</button>
                     <button class="chat-send-chevron" id="chat-send-chevron" type="button" title="More send options" aria-label="More send options">
@@ -111,14 +111,10 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     const attachmentPreview = document.getElementById('chat-attachment-preview');
     let pendingAttachment = null;
 
-    attachBtn.addEventListener('click', () => fileInput.click());
-
-    // Stage the selected File object locally — no server upload until sendMessage().
-    // This avoids orphan files, race conditions with fast-send, and network usage for unsent files.
-    fileInput.addEventListener('change', () => {
-        const file = fileInput.files[0];
+    // Shared stager: paperclip change handler AND clipboard paste both go through here
+    // so the attachment badge / removal UI / upload-on-Send semantics are identical.
+    function stagePendingFile(file) {
         if (!file) return;
-        fileInput.value = '';
         pendingAttachment = { file, display_name: file.name };
         attachmentPreview.classList.add('visible');
         attachmentPreview.innerHTML = `
@@ -128,13 +124,50 @@ export function initChat({ ws, state, updateUnreadBadge }) {
                 <button class="attach-remove" type="button" title="Remove">×</button>
             </span>
         `;
-        requestAnimationFrame(() => updateMessagesPadding());
+        requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
         attachmentPreview.querySelector('.attach-remove').addEventListener('click', () => {
             pendingAttachment = null;
             attachmentPreview.classList.remove('visible');
             attachmentPreview.innerHTML = '';
-            requestAnimationFrame(() => updateMessagesPadding());
+            requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
         });
+    }
+
+    attachBtn.addEventListener('click', () => fileInput.click());
+
+    // Stage the selected File object locally — no server upload until sendMessage().
+    // This avoids orphan files, race conditions with fast-send, and network usage for unsent files.
+    fileInput.addEventListener('change', () => {
+        const file = fileInput.files[0];
+        if (!file) return;
+        fileInput.value = '';
+        stagePendingFile(file);
+    });
+
+    // Clipboard image paste: scan clipboardData.items for image/*, wrap as File via
+    // getAsFile(), and route through the same stagePendingFile() path the paperclip
+    // uses. preventDefault() runs ONLY when an image is matched so non-image clipboard
+    // payloads (text, formatted text) still paste natively into the textarea. The
+    // generated filename uses a unix timestamp + the MIME-derived extension so each
+    // paste is a distinct attachment if the user pastes several in a row.
+    input.addEventListener('paste', (e) => {
+        const items = e.clipboardData && e.clipboardData.items;
+        if (!items) return;
+        for (let i = 0; i < items.length; i += 1) {
+            const item = items[i];
+            if (item && item.kind === 'file' && typeof item.type === 'string' && item.type.startsWith('image/')) {
+                const blob = item.getAsFile();
+                if (!blob) continue;
+                e.preventDefault();
+                const ext = (item.type.split('/')[1] || 'png').split(';')[0].trim() || 'png';
+                const ts = Date.now();
+                const safeBlob = blob instanceof File
+                    ? new File([blob], `clipboard-${ts}.${ext}`, { type: blob.type })
+                    : new File([blob], `clipboard-${ts}.${ext}`, { type: item.type });
+                stagePendingFile(safeBlob);
+                return;
+            }
+        }
     });
 
     // Set to true during syncHistory pass 1 to suppress premature DOM insertion of
@@ -1190,7 +1223,8 @@ export function initChat({ ws, state, updateUnreadBadge }) {
                 // user was already near the bottom to avoid hijacking scroll
                 // position when they are reading older messages.
                 if (wasFirstLoad || isNearBottom()) {
-                    messagesDiv.scrollTop = messagesDiv.scrollHeight;
+                    updateMessagesPadding({ preserveStickiness: false });
+                    scrollToBottomAfterLayout();
                 }
                 return messages.length > 0;
             } catch (err) {
@@ -1241,6 +1275,15 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         inputDraft = '';
     }
 
+    function resizeChatInput({ preserveStickiness = false } = {}) {
+        const caretAtEnd = input.selectionEnd >= input.value.length - 1;
+        const previousScrollTop = input.scrollTop;
+        input.style.height = 'auto';
+        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+        input.scrollTop = caretAtEnd ? input.scrollHeight : previousScrollTop;
+        updateMessagesPadding({ preserveStickiness });
+    }
+
     function restoreInputHistory(step) {
         if (!inputHistory.length) return;
         if (step < 0) {
@@ -1253,9 +1296,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
             inputHistoryIndex = Math.min(inputHistory.length, inputHistoryIndex + 1);
             input.value = inputHistoryIndex === inputHistory.length ? inputDraft : (inputHistory[inputHistoryIndex] || '');
         }
-        input.style.height = 'auto';
-        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
-        updateMessagesPadding();
+        resizeChatInput({ preserveStickiness: false });
         const cursor = input.value.length;
         input.setSelectionRange(cursor, cursor);
     }
@@ -1273,7 +1314,7 @@ export function initChat({ ws, state, updateUnreadBadge }) {
                 return;
             }
             const staged = pendingAttachment;
-            sendBtn.disabled = true;
+            setSendBusy(true, 'Uploading');
             try {
                 const formData = new FormData();
                 formData.append('file', staged.file);
@@ -1281,29 +1322,26 @@ export function initChat({ ws, state, updateUnreadBadge }) {
                 const data = await resp.json();
                 if (!resp.ok || !data.ok) {
                     alert('Upload failed: ' + (data.error || resp.statusText));
-                    sendBtn.disabled = false;
                     return;  // pendingAttachment and preview remain — user can retry
                 }
                 // Upload succeeded — clear the staged attachment now that it's on the server
                 pendingAttachment = null;
                 attachmentPreview.classList.remove('visible');
                 attachmentPreview.innerHTML = '';
-                requestAnimationFrame(() => updateMessagesPadding());
+                requestAnimationFrame(() => updateMessagesPadding({ preserveStickiness: false }));
                 text += (text ? '\n\n' : '') + `[Attached file: ${data.display_name || staged.display_name} saved to ${data.path}]`;
             } catch (e) {
                 alert('Upload error: ' + e.message);
-                sendBtn.disabled = false;
                 return;  // pendingAttachment and preview remain — user can retry
             } finally {
-                sendBtn.disabled = false;
+                setSendBusy(false);
             }
         }
         if (!text) return;
         // Recall history always uses the raw user text (no prefix pollution on ArrowUp).
         rememberInput(text);
         input.value = '';
-        input.style.height = 'auto';
-        updateMessagesPadding();
+        resizeChatInput({ preserveStickiness: true });
         // Apply planning prefix to wire content only; display text stays clean.
         // Slash commands are always sent verbatim regardless of planMode.
         const wireText = (planMode && !text.startsWith('/')) ? PLAN_PREFIX + text : text;
@@ -1332,6 +1370,18 @@ export function initChat({ ws, state, updateUnreadBadge }) {
         // Mark the active item in the dropdown for visual feedback.
         dropdownSend.dataset.modeActive = mode === 'send' ? 'true' : 'false';
         dropdownPlan.dataset.modeActive = mode === 'plan' ? 'true' : 'false';
+    }
+
+    function setSendBusy(busy, label = '') {
+        sendGroup.dataset.busy = busy ? '1' : '0';
+        sendBtn.disabled = busy;
+        chevronBtn.disabled = busy;
+        if (busy) {
+            sendBtn.textContent = label || 'Sending';
+            sendBtn.title = label || 'Sending';
+        } else {
+            setSendMode(sendGroup.dataset.sendMode || 'send');
+        }
     }
 
     // Initialise to send mode.
@@ -1390,16 +1440,35 @@ export function initChat({ ws, state, updateUnreadBadge }) {
     // the absolute-positioned #chat-input-area overlay, so the last bubble is always
     // fully visible with a small buffer — no more excessive gap or hidden content.
     const inputArea = document.getElementById('chat-input-area');
-    function updateMessagesPadding() {
+    function scrollToBottom() {
+        messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function scrollToBottomAfterLayout() {
+        requestAnimationFrame(() => {
+            scrollToBottom();
+            requestAnimationFrame(scrollToBottom);
+        });
+    }
+
+    function updateMessagesPadding(options = {}) {
+        const preserveStickiness = options.preserveStickiness !== false;
+        const shouldStick = preserveStickiness && isNearBottom(160);
         const h = inputArea ? inputArea.offsetHeight : 84;
         messagesDiv.style.paddingBottom = (h + 16) + 'px';
+        if (shouldStick) scrollToBottomAfterLayout();
+    }
+
+    if (window.ResizeObserver && inputArea) {
+        // Composer height changes come from typing/attachment staging; avoid
+        // forcing the transcript while the user is editing on a soft keyboard.
+        const inputResizeObserver = new ResizeObserver(() => updateMessagesPadding({ preserveStickiness: false }));
+        inputResizeObserver.observe(inputArea);
     }
 
     input.addEventListener('input', () => {
-        input.style.height = 'auto';
-        input.style.height = Math.min(input.scrollHeight, 120) + 'px';
         if (inputHistoryIndex === inputHistory.length) inputDraft = input.value;
-        updateMessagesPadding();
+        resizeChatInput({ preserveStickiness: false });
     });
 
     headerActions?.addEventListener('click', (event) => {

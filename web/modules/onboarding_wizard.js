@@ -26,7 +26,7 @@
             title: 'Choose review mode',
             railCopy: 'Advisory vs blocking',
             copy: 'Decide how strict pre-commit review should be before Ouroboros starts modifying itself.',
-            footer: 'You can change review enforcement and runtime mode later in Settings → Behavior.',
+            footer: 'Pick both review enforcement and the initial runtime mode before Ouroboros starts.',
         },
         budget: {
             title: 'Set your budget',
@@ -699,6 +699,11 @@
 
     function renderReviewModeStep() {
         const runtimeMode = trim(state.runtimeMode) || 'advanced';
+        const runtimeModeDisabled = HOST_MODE !== 'desktop';
+        const runtimeModeCopy = runtimeModeDisabled
+            ? 'Runtime mode is owner-controlled in web/Docker onboarding and cannot be saved through /api/settings. Use the desktop launcher or edit settings.json while stopped.'
+            : 'Separate axis from review enforcement. This first-run choice becomes the boot baseline before Ouroboros starts; later elevation requires native launcher confirmation.';
+        const disabledAttr = runtimeModeDisabled ? ' disabled aria-disabled="true"' : '';
         return `
             <div class="step-header">
                 <div>
@@ -720,19 +725,19 @@
             </div>
             <div class="panel-card runtime-mode-card">
                 <h3>Runtime mode</h3>
-                <p class="field-note">Separate axis from review enforcement. Controls how far Ouroboros is allowed to self-modify. You can change this later in Settings → Behavior.</p>
+                <p class="field-note">${escapeHtml(runtimeModeCopy)}</p>
                 <div class="wizard-choice-grid three">
-                    <button type="button" class="wizard-choice light ${runtimeMode === 'light' ? 'active' : ''}" data-runtime-mode="light">
+                    <button type="button" class="wizard-choice light ${runtimeMode === 'light' ? 'active' : ''}" data-runtime-mode="light"${disabledAttr}>
                         <span class="tone">Safest</span>
                         <h3>Light</h3>
                         <p>Self-modification of the main repo is disabled. Best for trying Ouroboros out or running it as a pure assistant.</p>
                     </button>
-                    <button type="button" class="wizard-choice advanced ${runtimeMode === 'advanced' ? 'active' : ''}" data-runtime-mode="advanced">
+                    <button type="button" class="wizard-choice advanced ${runtimeMode === 'advanced' ? 'active' : ''}" data-runtime-mode="advanced"${disabledAttr}>
                         <span class="tone">Default</span>
                         <h3>Advanced</h3>
                         <p>Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode.</p>
                     </button>
-                    <button type="button" class="wizard-choice pro ${runtimeMode === 'pro' ? 'active' : ''}" data-runtime-mode="pro">
+                    <button type="button" class="wizard-choice pro ${runtimeMode === 'pro' ? 'active' : ''}" data-runtime-mode="pro"${disabledAttr}>
                         <span class="tone">Power</span>
                         <h3>Pro</h3>
                         <p>Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate.</p>
@@ -1129,7 +1134,6 @@
             TOTAL_BUDGET: Number(state.totalBudget || 0),
             OUROBOROS_PER_TASK_COST_USD: Number(state.perTaskCostUsd || 0),
             OUROBOROS_REVIEW_ENFORCEMENT: trim(state.reviewEnforcement) || 'advisory',
-            OUROBOROS_RUNTIME_MODE: trim(state.runtimeMode) || 'advanced',
             OUROBOROS_SKILLS_REPO_PATH: trim(state.skillsRepoPath),
             LOCAL_MODEL_SOURCE: trim(state.localSource),
             LOCAL_MODEL_FILENAME: trim(state.localFilename),
@@ -1142,6 +1146,9 @@
             OUROBOROS_MODEL_LIGHT: trim(state.lightModel),
             OUROBOROS_MODEL_FALLBACK: trim(state.fallbackModel),
         };
+        if (HOST_MODE === 'desktop') {
+            payload.OUROBOROS_RUNTIME_MODE = trim(state.runtimeMode) || 'advanced';
+        }
         try {
             await saveWizardPayload(payload);
         } catch (error) {

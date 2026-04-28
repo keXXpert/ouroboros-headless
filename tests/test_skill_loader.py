@@ -756,9 +756,11 @@ def test_summarize_skills_shape_contains_counts_and_flat_list(tmp_path):
 
 
 def test_summarize_skills_reflects_runtime_mode_light(tmp_path, monkeypatch):
-    """Phase 3 round 11 regression: a reviewed+enabled skill must NOT
-    be reported as ``available`` when ``OUROBOROS_RUNTIME_MODE=light``,
-    because ``skill_exec`` refuses to run anything in light mode."""
+    """v5.1.2 Frame A: a reviewed + enabled skill stays ``available``
+    in light mode, because ``skill_exec`` no longer refuses light.
+    The static-readiness signal and the available-for-execution flag
+    converge in this release; ``runtime_blocked`` always counts 0 once
+    the runtime-mode gate is gone."""
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
     repo_root = tmp_path / "skills"
@@ -787,15 +789,15 @@ def test_summarize_skills_reflects_runtime_mode_light(tmp_path, monkeypatch):
     assert adv["runtime_blocked"] == 0
     assert adv["skills"][0]["available_for_execution"] is True
 
-    # light → NOT available, but runtime_blocked increments
+    # v5.1.2 Frame A: light is also ``available`` — skills run regardless
+    # of runtime_mode (light still blocks repo self-modification +
+    # elevation ratchet, just not skill execution).
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     light = summarize_skills(drive_root)
-    assert light["available"] == 0
-    assert light["runtime_blocked"] == 1
-    assert light["skills"][0]["available_for_execution"] is False
-    assert light["skills"][0]["runtime_blocked_by_mode"] is True
-    # The static readiness signal is preserved so the UI can still
-    # explain "this would be ready if you were in advanced mode".
+    assert light["available"] == 1
+    assert light["runtime_blocked"] == 0
+    assert light["skills"][0]["available_for_execution"] is True
+    assert light["skills"][0]["runtime_blocked_by_mode"] is False
     assert light["skills"][0]["static_ready"] is True
 
 
@@ -804,6 +806,183 @@ def test_valid_review_statuses_exported():
     assert "fail" in VALID_REVIEW_STATUSES
     assert "pending" in VALID_REVIEW_STATUSES
     assert "pending_phase4" in VALID_REVIEW_STATUSES
+
+
+def test_skill_grants_are_content_and_request_bound(tmp_path):
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import (
+        LoadedSkill,
+        SkillReviewState,
+        grant_status_for_skill,
+        save_skill_grants,
+    )
+
+    drive_root = tmp_path / "drive"
+    skill_dir = tmp_path / "skill"
+    drive_root.mkdir()
+    skill_dir.mkdir()
+    manifest = SkillManifest(
+        name="granty",
+        description="grant test",
+        version="0.1",
+        type="script",
+        env_from_settings=["OPENROUTER_API_KEY"],
+    )
+    skill = LoadedSkill(
+        name="granty",
+        skill_dir=skill_dir,
+        manifest=manifest,
+        content_hash="hash-a",
+        review=SkillReviewState(status="pass", content_hash="hash-a"),
+    )
+    save_skill_grants(
+        drive_root,
+        "granty",
+        ["OPENROUTER_API_KEY", "GITHUB_TOKEN"],
+        content_hash="hash-a",
+        requested_keys=["OPENROUTER_API_KEY"],
+    )
+    status = grant_status_for_skill(drive_root, skill)
+    assert status["granted_keys"] == ["OPENROUTER_API_KEY"]
+    assert status["all_granted"] is True
+    skill.content_hash = "hash-b"
+    stale = grant_status_for_skill(drive_root, skill)
+    assert stale["granted_keys"] == []
+    assert stale["missing_keys"] == ["OPENROUTER_API_KEY"]
+
+    skill.content_hash = "hash-a"
+    skill.source = "clawhub"
+    unsupported = grant_status_for_skill(drive_root, skill)
+    assert unsupported["unsupported_for_skill_type"] is False
+    assert unsupported["usable"] is True
+    assert unsupported["granted_keys"] == ["OPENROUTER_API_KEY"]
+
+
+def test_grant_status_supports_extension_skills(tmp_path):
+    """v5.2.2 dual-track grants: ``type: extension`` skills are now
+    eligible for owner core-key grants alongside ``type: script``."""
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import (
+        LoadedSkill,
+        SkillReviewState,
+        grant_status_for_skill,
+        save_skill_grants,
+    )
+
+    drive_root = tmp_path / "drive"
+    skill_dir = tmp_path / "ext"
+    drive_root.mkdir()
+    skill_dir.mkdir()
+    manifest = SkillManifest(
+        name="ext_grant",
+        description="extension grant test",
+        version="0.1",
+        type="extension",
+        env_from_settings=["OPENROUTER_API_KEY"],
+        permissions=["read_settings"],
+    )
+    skill = LoadedSkill(
+        name="ext_grant",
+        skill_dir=skill_dir,
+        manifest=manifest,
+        content_hash="ext-hash",
+        review=SkillReviewState(status="pass", content_hash="ext-hash"),
+    )
+    no_grant = grant_status_for_skill(drive_root, skill)
+    assert no_grant["unsupported_for_skill_type"] is False
+    assert no_grant["all_granted"] is False
+    assert no_grant["missing_keys"] == ["OPENROUTER_API_KEY"]
+
+    save_skill_grants(
+        drive_root,
+        "ext_grant",
+        ["OPENROUTER_API_KEY"],
+        content_hash="ext-hash",
+        requested_keys=["OPENROUTER_API_KEY"],
+    )
+    granted = grant_status_for_skill(drive_root, skill)
+    assert granted["unsupported_for_skill_type"] is False
+    assert granted["all_granted"] is True
+    assert granted["usable"] is True
+    assert granted["granted_keys"] == ["OPENROUTER_API_KEY"]
+
+
+def test_save_skill_grants_merges_partial_approvals(tmp_path):
+    """A subsequent partial-key grant must not silently revoke
+    previously-approved keys. The merge is bound to the same
+    content_hash + requested_keys; any change to either resets the
+    persisted state because the owner has not consented to the new
+    shape yet."""
+    from ouroboros.skill_loader import (
+        load_skill_grants,
+        save_skill_grants,
+    )
+
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+
+    save_skill_grants(
+        drive_root,
+        "merge_demo",
+        ["OPENROUTER_API_KEY"],
+        content_hash="hash-x",
+        requested_keys=["OPENROUTER_API_KEY", "GITHUB_TOKEN"],
+    )
+    save_skill_grants(
+        drive_root,
+        "merge_demo",
+        ["GITHUB_TOKEN"],
+        content_hash="hash-x",
+        requested_keys=["OPENROUTER_API_KEY", "GITHUB_TOKEN"],
+    )
+    after_merge = load_skill_grants(drive_root, "merge_demo")
+    assert sorted(after_merge["granted_keys"]) == ["GITHUB_TOKEN", "OPENROUTER_API_KEY"]
+
+    # New content hash invalidates the previous persisted state.
+    save_skill_grants(
+        drive_root,
+        "merge_demo",
+        ["OPENROUTER_API_KEY"],
+        content_hash="hash-y",
+        requested_keys=["OPENROUTER_API_KEY", "GITHUB_TOKEN"],
+    )
+    after_rotate = load_skill_grants(drive_root, "merge_demo")
+    assert after_rotate["content_hash"] == "hash-y"
+    assert after_rotate["granted_keys"] == ["OPENROUTER_API_KEY"]
+
+
+def test_grant_status_unsupported_for_instruction_skills(tmp_path):
+    """Instruction-type skills cannot receive core grants — they have
+    no executable surface, so a grant would be meaningless."""
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import (
+        LoadedSkill,
+        SkillReviewState,
+        grant_status_for_skill,
+    )
+
+    drive_root = tmp_path / "drive"
+    skill_dir = tmp_path / "instr"
+    drive_root.mkdir()
+    skill_dir.mkdir()
+    manifest = SkillManifest(
+        name="instr_grant",
+        description="instruction grant test",
+        version="0.1",
+        type="instruction",
+        env_from_settings=["OPENROUTER_API_KEY"],
+    )
+    skill = LoadedSkill(
+        name="instr_grant",
+        skill_dir=skill_dir,
+        manifest=manifest,
+        content_hash="instr-hash",
+        review=SkillReviewState(status="pass", content_hash="instr-hash"),
+    )
+    status = grant_status_for_skill(drive_root, skill)
+    assert status["unsupported_for_skill_type"] is True
+    assert status["all_granted"] is False
+    assert status["usable"] is False
 
 
 # ---------------------------------------------------------------------------
