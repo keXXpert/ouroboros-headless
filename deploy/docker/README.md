@@ -91,16 +91,22 @@ sudo journalctl -u ouroboros-headless -f
 sudo /opt/ouroboros-headless/deploy/docker/doctor.sh
 ```
 
-## Git remote ownership model (independent runtime)
+## Git remote ownership model (bind-mounted runtime repo)
 
-After install, the runtime repo is intentionally detached from installer `origin`:
+The container now bind-mounts the host repository (`/opt/ouroboros-headless -> /app`).
+Agent commits are persisted directly in the host git checkout.
+
+Remote model:
 
 - installer/upstream remote is stored as `seed` (used by `update.sh`),
 - `origin` is left free for the operator's own repository (optional).
 
-That means users can keep running locally with no GitHub at all, or later set
-`GITHUB_TOKEN` + `GITHUB_REPO` in Settings to attach their own `origin` and push
-evolution history into their own repo.
+`update.sh` now syncs **only local `main`** to the target ref (`--ref`/`--rollback`).
+It does not switch the active working branch to detached remote refs.
+
+If `main` cannot fast-forward (or has uncommitted changes while checked out),
+`update.sh` asks interactively whether to abort or hard-reset only `main`
+(use `--force-main-reset` for non-interactive automation).
 
 By design, `update.sh` runs `compose up -d` **without `--build`** in bind-mount mode.
 This is fast for code-only updates, but image-level dependency changes (apt/system libs,

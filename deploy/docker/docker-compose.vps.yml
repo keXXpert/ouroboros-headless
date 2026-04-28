@@ -16,6 +16,7 @@ services:
     ports:
       - "${OUROBOROS_HOST_BIND:-127.0.0.1}:${OUROBOROS_SERVER_PORT:-8765}:${OUROBOROS_SERVER_PORT:-8765}"
     volumes:
+      - ${OUROBOROS_REPO_DIR_HOST:-/opt/ouroboros-headless}:/app
       - /var/lib/ouroboros-headless/data:/var/lib/ouroboros-headless/data
       - /var/lib/ouroboros-headless/workspace:/var/lib/ouroboros-headless/workspace
     healthcheck:
