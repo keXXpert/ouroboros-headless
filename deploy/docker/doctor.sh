@@ -85,7 +85,26 @@ else
   warn "docker compose ps failed."
 fi
 
+repo_dir_host="$(read_env_value "OUROBOROS_REPO_DIR_HOST")"
+[[ -n "${repo_dir_host}" ]] || repo_dir_host="/opt/ouroboros-headless"
 if docker ps --format '{{.Names}}' | grep -qx 'ouroboros-headless'; then
+  if docker exec ouroboros-headless sh -lc '[ -d /app/.git ]'; then
+    info "Container repo mount: /app/.git present"
+  else
+    warn "Container repo mount: /app/.git missing (bind-mount may be broken)"
+  fi
+
+  mount_src="$(docker inspect ouroboros-headless --format '{{range .Mounts}}{{if eq .Destination "/app"}}{{.Source}}{{end}}{{end}}' 2>/dev/null || true)"
+  if [[ -n "${mount_src}" ]]; then
+    if [[ "${mount_src}" == "${repo_dir_host}" ]]; then
+      info "Container /app mount source: ${mount_src}"
+    else
+      warn "Container /app mount source mismatch: ${mount_src} (expected ${repo_dir_host})"
+    fi
+  else
+    warn "Container /app mount source: not found"
+  fi
+
   for bin in git gh curl wget jq rg python3 pytest node npm; do
     if docker exec ouroboros-headless sh -lc "command -v ${bin} >/dev/null 2>&1"; then
       info "Container ${bin}: present"
