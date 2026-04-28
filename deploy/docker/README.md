@@ -102,6 +102,10 @@ That means users can keep running locally with no GitHub at all, or later set
 `GITHUB_TOKEN` + `GITHUB_REPO` in Settings to attach their own `origin` and push
 evolution history into their own repo.
 
+By design, `update.sh` runs `compose up -d` **without `--build`** in bind-mount mode.
+This is fast for code-only updates, but image-level dependency changes (apt/system libs,
+Python/Node packages installed at image build time, etc.) still require an explicit image rebuild.
+
 `doctor.sh` checks `/api/health`, `/api/state` (`supervisor_ready`, `workers_alive`) and WebSocket handshake.
 
 ## Update and rollback
