@@ -177,15 +177,27 @@ validate_security_contracts() {
 }
 
 wait_for_health() {
-  local port attempts sleep_seconds i
+  local port attempts sleep_seconds i host_bind host url_host
   port="${1:-$(server_port)}"
   attempts="${2:-20}"
   sleep_seconds="${3:-2}"
 
+  host_bind="$(read_env_value "OUROBOROS_SERVER_HOST")"
+  [[ -n "${host_bind}" ]] || host_bind="127.0.0.1"
+
   for ((i = 1; i <= attempts; i++)); do
-    if curl -fsS "http://127.0.0.1:${port}/api/health" >/dev/null 2>&1; then
-      return 0
-    fi
+    for host in "${host_bind}" "127.0.0.1"; do
+      [[ "${host}" == "0.0.0.0" || "${host}" == "::" ]] && host="127.0.0.1"
+      if [[ "${host}" == *:* ]]; then
+        url_host="[${host}]"
+      else
+        url_host="${host}"
+      fi
+
+      if curl -fsS "http://${url_host}:${port}/api/health" >/dev/null 2>&1; then
+        return 0
+      fi
+    done
     sleep "${sleep_seconds}"
   done
   return 1

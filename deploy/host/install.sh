@@ -251,7 +251,7 @@ export GIT_CONFIG_VALUE_0="${REPO_DIR}"
 git config --global --add safe.directory "${REPO_DIR}" || true
 
 ensure_seed_remote "${REPO_URL}"
-fetch_deploy_remote
+run_as_app_user git -C "${REPO_DIR}" fetch "$(deploy_remote_name)" --tags
 resolved_ref="$(resolve_checkout_ref "${REF}")"
 run_as_app_user git -C "${REPO_DIR}" checkout "${resolved_ref}"
 
@@ -348,7 +348,7 @@ fi
 
 if [[ "${browser_tools_enabled}" == "1" ]]; then
   info "Installing browser tools host dependencies..."
-  "${REPO_DIR}/deploy/host/enable-browser-tools.sh"
+  HOME="${APP_HOME}" "${REPO_DIR}/deploy/host/enable-browser-tools.sh"
 fi
 
 # Pre-clean stray runtime processes not managed by the current systemd user unit.
