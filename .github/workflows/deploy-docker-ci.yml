@@ -1,0 +1,37 @@
+name: Deploy Docker CI
+
+on:
+  push:
+    paths:
+      - 'deploy/docker/**'
+      - 'Dockerfile'
+      - '.github/workflows/deploy-docker-ci.yml'
+  pull_request:
+    paths:
+      - 'deploy/docker/**'
+      - 'Dockerfile'
+      - '.github/workflows/deploy-docker-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-docker-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Bash syntax check
+        run: |
+          bash -n deploy/docker/*.sh
+
+      - name: Shellcheck
+        run: |
+          shellcheck -S error deploy/docker/*.sh
+
+      - name: Docker compose config check
+        run: |
+          export OUROBOROS_ENV_FILE="${GITHUB_WORKSPACE}/deploy/docker/.env.example"
+          export OUROBOROS_REPO_DIR_HOST="${GITHUB_WORKSPACE}"
+          docker compose --env-file "${OUROBOROS_ENV_FILE}" -f deploy/docker/docker-compose.vps.yml config >/dev/null

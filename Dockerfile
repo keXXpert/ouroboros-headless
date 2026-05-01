@@ -5,9 +5,23 @@
 
 FROM python:3.10-slim
 
-# System dependencies (git + Playwright/Chromium native libs installed via playwright install-deps)
+# System dependencies:
+# - git/gh for repo & GitHub tooling
+# - curl/wget for runtime diagnostics and quick network probes
+# - ripgrep/jq for fast search + JSON inspection in shell workflows
+# - (pytest is installed via pip in the same Python environment)
+# - procps/lsof for process/port diagnostics
+# Playwright/Chromium native libs are installed later via playwright install-deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
     git \
+    gh \
+    curl \
+    wget \
+    jq \
+    ripgrep \
+    procps \
+    lsof \
     && rm -rf /var/lib/apt/lists/*
 
 # Working directory
@@ -16,13 +30,19 @@ WORKDIR ${APP_HOME}
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m pip install --no-cache-dir -r requirements.txt \
+    && python -m pip install --no-cache-dir pytest \
+    && python -c "import starlette,requests,httpx,pytest"
 
-# Install all Playwright native system dependencies for Chromium (authoritative list from Playwright)
-RUN python3 -m playwright install-deps chromium
-
-# Install Playwright Chromium browser binary so browser tools work out of the box
-RUN PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium
+# Optional browser tooling layer (Chromium + deps)
+# 1 = install browser tooling, 0 = skip (lean VPS profile)
+ARG OUROBOROS_INSTALL_BROWSER_TOOLS=1
+RUN if [ "${OUROBOROS_INSTALL_BROWSER_TOOLS}" = "1" ]; then \
+      python3 -m playwright install-deps chromium && \
+      PLAYWRIGHT_BROWSERS_PATH=0 python3 -m playwright install chromium ; \
+    else \
+      echo "Skipping browser tooling install (OUROBOROS_INSTALL_BROWSER_TOOLS=${OUROBOROS_INSTALL_BROWSER_TOOLS})" ; \
+    fi
 
 # Copy application
 COPY . .
